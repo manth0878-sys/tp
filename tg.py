@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v10.0 (Per-User Isolation + Force Join + Admin Panel)
+# Opella Hunter — v12.0 (Multi Force-Join + Silent Storage + Admin Panel)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, shutil, zipfile
@@ -25,15 +25,24 @@ from telegram.error import BadRequest
 # ════════════════════════════════════════════════════════════
 CREDIT   = "JD"
 BOT_NAME = "Opella Hunter"
-BOT_TOKEN = "8871069553:AAFE_nTLyLlnXnCL40lfCc5v47lAome6tHU"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
 
-# ⭐ FORCE JOIN CONFIG
+# ⭐ FORCE JOIN CHANNELS (all required)
+FORCE_CHANNELS = [
+    {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
+    {"username": "@unknown012021",   "url": "https://t.me/unknown012021"},
+    {"username": "@mh_lootifu",      "url": "https://t.me/mh_lootifu"},
+    {"username": "@jdlooter",        "url": "https://t.me/jdlooter"},
+]
+
+# Backwards-compat references
 CHANNEL_USERNAME = "@camplootersonly"
 CHANNEL_URL = "https://t.me/camplootersonly"
 
-# ⭐ ADMIN CONFIG
-OWNER_ID = 8880545620
-ADMINS_FILE = Path(__file__).parent.resolve() / "admins.json"
+# ⭐ ADMIN
+OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
+ADMINS_FILE = DATA_DIR / "admins.json"
 
 def load_admins() -> Set[int]:
     if ADMINS_FILE.exists():
@@ -45,6 +54,7 @@ def load_admins() -> Set[int]:
     return {OWNER_ID}
 
 def save_admins(admins: Set[int]):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(ADMINS_FILE, "w") as f:
         json.dump({"admins": list(admins)}, f, indent=2)
 
@@ -54,11 +64,10 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMINS or user_id == OWNER_ID
 
 # ⭐ PER-USER STORAGE
-BASE_DIR = Path(__file__).parent.resolve()
-USERS_DIR = BASE_DIR / "users"
-USERS_DIR.mkdir(exist_ok=True)
-LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+USERS_DIR = DATA_DIR / "users"
+USERS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR = DATA_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_URL = "https://www.worldpharmacistdaybyopella.com"
 API_BASE = f"{BASE_URL}/api"
@@ -99,7 +108,7 @@ USED_OTPS_LOCK = threading.Lock()
 NO_PROXY = {"http": None, "https": None}
 
 # ════════════════════════════════════════════════════════════
-#  PER-USER PATHS
+#  PER-USER PATHS (internal only)
 # ════════════════════════════════════════════════════════════
 def user_dir(user_id: int) -> Path:
     d = USERS_DIR / str(user_id)
@@ -134,35 +143,60 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN CHECK
+#  FORCE JOIN (multi-channel)
 # ════════════════════════════════════════════════════════════
 async def is_user_joined(user_id: int) -> bool:
-    try:
-        member = await BOT_APP.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as e:
-        print(f"join check err: {e}")
-        return False
+    for ch in FORCE_CHANNELS:
+        try:
+            member = await BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
+            if member.status not in ("member", "administrator", "creator"):
+                return False
+        except Exception as e:
+            print(f"join check err ({ch['username']}): {e}")
+            return False
+    return True
 
-def join_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{C['join']} Join Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton(f"{C['check']} I Joined — Verify", callback_data="verify_join")],
-    ])
+async def missing_channels(user_id: int) -> List[Dict[str, str]]:
+    missing = []
+    for ch in FORCE_CHANNELS:
+        try:
+            member = await BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
+            if member.status not in ("member", "administrator", "creator"):
+                missing.append(ch)
+        except Exception as e:
+            print(f"join check err ({ch['username']}): {e}")
+            missing.append(ch)
+    return missing
+
+def join_kb(missing: Optional[List[Dict[str, str]]] = None):
+    if missing is None:
+        missing = FORCE_CHANNELS
+    rows = []
+    for ch in missing:
+        rows.append([InlineKeyboardButton(
+            f"{C['join']} Join {ch['username']}", url=ch["url"])])
+    rows.append([InlineKeyboardButton(
+        f"{C['check']} I Joined — Verify", callback_data="verify_join")])
+    return InlineKeyboardMarkup(rows)
 
 async def require_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if user is None: return False
-    if await is_user_joined(user.id):
+
+    missing = await missing_channels(user.id)
+    if not missing:
         return True
 
+    ch_list = "\n".join(f"  {i}. <a href='{c['url']}'>{c['username']}</a>"
+                        for i, c in enumerate(missing, 1))
     text = (
         f"{C['lock']} <b>Access Restricted</b>\n"
         f"{'─'*40}\n"
-        f"You must join <a href='{CHANNEL_URL}'>{CHANNEL_USERNAME}</a>\n"
-        f"to use this bot.\n\n"
-        f"1. Tap the button below\n"
-        f"2. Join the channel\n"
+        f"You must join <b>{len(missing)}</b> channel(s) to use this bot:\n"
+        f"{ch_list}\n\n"
+        f"{'─'*40}\n"
+        f"1. Tap each button below\n"
+        f"2. Join all channels\n"
         f"3. Come back and tap Verify\n"
         f"{'─'*40}\n"
         f"<i>Support: @CAMPLOOTERSCC</i>"
@@ -170,15 +204,14 @@ async def require_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         await update.effective_message.reply_text(
             text, parse_mode="HTML",
-            reply_markup=join_kb(),
-            disable_web_page_preview=True,
-        )
+            reply_markup=join_kb(missing),
+            disable_web_page_preview=True)
     except Exception as e:
         print(f"join prompt err: {e}")
     return False
 
 # ════════════════════════════════════════════════════════════
-#  PROXY (per-user)
+#  PROXY
 # ════════════════════════════════════════════════════════════
 def _parse_proxy_line(line):
     parts = line.strip().split(":")
@@ -352,6 +385,7 @@ def watch_voucher(user_id, fb_url, device_id, phone, tag="", timeout=VOUCHER_WAT
                 if mx:
                     voucher = mx.group(1)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                    # silent save
                     try:
                         with open(user_paths(user_id)["vouchers"], "a", encoding="utf-8") as f:
                             f.write(f"{voucher} | {ts} | phone={phone} | device={device_id}\n")
@@ -635,16 +669,22 @@ def rand_store():
     return f"{random.choice(first)} {random.choice(last)}"
 
 def save_win(user_id, phone, user_key, resp):
-    with open(user_paths(user_id)["wins"], "a", encoding="utf-8") as f:
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WIN {phone} user={user_key} reward={data.get('rewardType')} amt={data.get('rewardAmount')}\n")
+    # silent save
+    try:
+        with open(user_paths(user_id)["wins"], "a", encoding="utf-8") as f:
+            data = resp.get("data", {}) if isinstance(resp, dict) else {}
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WIN {phone} user={user_key} reward={data.get('rewardType')} amt={data.get('rewardAmount')}\n")
+    except: pass
 
 def save_result(user_id, rec):
-    with PRINT_LOCK:
-        rf = user_paths(user_id)["results"]
-        data = load_json(rf, {"results": []})
-        data.setdefault("results", []).append(rec)
-        save_json(rf, data)
+    # silent save
+    try:
+        with PRINT_LOCK:
+            rf = user_paths(user_id)["results"]
+            data = load_json(rf, {"results": []})
+            data.setdefault("results", []).append(rec)
+            save_json(rf, data)
+    except: pass
 
 def _msg_of(d):
     if not isinstance(d, dict): return ""
@@ -670,7 +710,6 @@ def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, prox
             res["status"] = "create_failed"; res["error"] = cu.get("message")
             push_log(f"[{tag}] ❌ {phone} create: {cu.get('message')}", "err"); return res
         res["user_key"] = c.user_key
-        push_log(f"[{tag}] → {phone} user={c.user_key}", "ok")
         c.landing_track("watched_video"); time.sleep(random.uniform(*LANDING_SLEEP))
         c.landing_track("continue_to_registration"); time.sleep(random.uniform(*LANDING_SLEEP))
         state, city = random.choice(st_pairs) if st_pairs else ("Karnataka", "Bangalore")
@@ -685,7 +724,7 @@ def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, prox
             res["status"] = "register_failed"; res["register_resp"] = r
             push_log(f"[{tag}] ❌ {phone} register: {r.get('message')}", "err"); return res
         res["register_ok"] = True
-        push_log(f"[{tag}] ✅ {phone} registered → OTP sent", "ok")
+        push_log(f"[{tag}] ✅ {phone} registered", "ok")
         otp = fetch_opella_otp(fb_url, device_id, timeout=OTP_MAX_WAIT, since_ts=sent_at)
         if not otp:
             res["status"] = "otp_timeout"
@@ -733,7 +772,7 @@ def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, prox
         except: pass
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM STATE (per-chat)
+#  TELEGRAM STATE
 # ════════════════════════════════════════════════════════════
 CHAT_STATE: Dict[int, Dict[str, Any]] = {}
 STATE_LOCK = threading.RLock()
@@ -924,7 +963,7 @@ async def _handle_log(chat_id, msg, cls):
     if re.search(r"→\s*\d+\s*user=", m): return
     if "spin_raw" in m: return
     cur_pidx = st["current_panel"] or 1
-    mo = re.search(r"(\d{10})[^\d]{0,20}OTP sent", m, re.I)
+    mo = re.search(r"(\d{10})[^\d]{0,20}registered", m, re.I)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["otp_sent"] = True
         st["otp_sent"] += 1; _kick_render(chat_id); return
@@ -969,21 +1008,6 @@ async def _handle_log(chat_id, msg, cls):
         st["current_panel"] = int(mo.group(1)); _kick_render(chat_id, force=True); return
     if re.search(r"err|exception", m, re.I):
         st["errors"] += 1; _kick_render(chat_id); return
-
-# ════════════════════════════════════════════════════════════
-#  HIT ALERT
-# ════════════════════════════════════════════════════════════
-async def send_hit_alert(chat_id, hit):
-    try:
-        text = (f"{C['hit']} HIT FOUND  ·  by {CREDIT}\n{LINE}\n"
-                f"code     ▸ <code>{esc(hit['voucher'])}</code>\n"
-                f"phone    ▸ {esc(hit['phone'])}\n"
-                f"device   ▸ {esc(hit['device'][:16])}\n"
-                f"panel    ▸ {esc(hit['panel'])}\n"
-                f"time     ▸ {datetime.now().strftime('%H:%M:%S')}\n{LINE}\n"
-                f"redeem   ▸ https://www.worldpharmacistdaybyopellarewards.com/")
-        await BOT_APP.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-    except Exception as e: print(f"hit alert err: {e}")
 
 # ════════════════════════════════════════════════════════════
 #  PANEL RUNNER
@@ -1041,7 +1065,7 @@ async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
         _current_chat.reset(token)
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM COMMANDS
+#  TELEGRAM KEYBOARDS
 # ════════════════════════════════════════════════════════════
 def main_menu_kb(user_id=None):
     buttons = [
@@ -1051,8 +1075,14 @@ def main_menu_kb(user_id=None):
          InlineKeyboardButton("🏆 Hits", callback_data="hits")],
         [InlineKeyboardButton("▤ Panels", callback_data="panels"),
          InlineKeyboardButton("🗑 Clear", callback_data="clear")],
-        [InlineKeyboardButton(f"{C['join']} Channel", url=CHANNEL_URL)],
     ]
+    # Add all force-join channels (2 per row)
+    ch_row = []
+    for ch in FORCE_CHANNELS:
+        ch_row.append(InlineKeyboardButton(f"{C['join']} {ch['username']}", url=ch["url"]))
+        if len(ch_row) == 2:
+            buttons.append(ch_row); ch_row = []
+    if ch_row: buttons.append(ch_row)
     if user_id and is_admin(user_id):
         buttons.insert(0, [InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(buttons)
@@ -1075,6 +1105,9 @@ async def _safe_reply(update, text, **kwargs):
         await BOT_APP.bot.send_message(chat.id, text, **kwargs); return
     await msg.reply_text(text, **kwargs)
 
+# ════════════════════════════════════════════════════════════
+#  USER COMMANDS
+# ════════════════════════════════════════════════════════════
 async def cmd_start(update, ctx):
     if not await require_join(update, ctx): return
     user_id = update.effective_user.id
@@ -1085,8 +1118,7 @@ async def cmd_start(update, ctx):
         f"{C['panel']} {BOT_NAME}  ·  by {CREDIT}\n{LINE}\n"
         f"Send panel URL(s) — one per line:\n"
         f"  <code>https://xxx.firebaseio.com</code>\n\n{LINE}\n"
-        f"Your files: <code>users/{user_id}/</code>\n"
-        f"Use buttons to control.{admin_btn}",
+        f"Use the buttons below to control.{admin_btn}",
         parse_mode="HTML", reply_markup=main_menu_kb(user_id))
 
 async def cmd_panel(update, ctx):
@@ -1108,10 +1140,14 @@ async def cmd_panel(update, ctx):
         st["panels"].append(parsed); added += 1
     if added:
         save_json(user_paths(update.effective_user.id)["panels"], {"panels": st["panels"]})
-    await _safe_reply(update,
-        f"{C['done']} added {added}  ·  dup {dup}  ·  total {len(st['panels'])}\n"
-        f"💾 saved to <code>users/{update.effective_user.id}/panels.json</code>",
-        parse_mode="HTML", reply_markup=main_menu_kb(update.effective_user.id))
+    if added:
+        await _safe_reply(update,
+            f"{C['done']} added {added}  ·  total {len(st['panels'])}",
+            reply_markup=main_menu_kb(update.effective_user.id))
+    elif dup:
+        await _safe_reply(update,
+            f"{C['already']} already exists  ·  total {len(st['panels'])}",
+            reply_markup=main_menu_kb(update.effective_user.id))
 
 async def cmd_run(update, ctx, chat_id=None):
     if not await require_join(update, ctx): return
@@ -1139,7 +1175,6 @@ async def cmd_run(update, ctx, chat_id=None):
     await _render_and_send(chat_id, force=True)
     await BOT_APP.bot.send_message(chat_id,
         f"{C['panel']} starting  ·  {len(st['panels'])} panel(s)\n"
-        f"📁 user dir: <code>users/{user_id}/</code>\n"
         f"{LINE} by {CREDIT}",
         parse_mode="HTML", reply_markup=main_menu_kb(user_id))
     async def _runner():
@@ -1158,9 +1193,7 @@ async def cmd_run(update, ctx, chat_id=None):
 
 async def send_final(chat_id, user_id):
     st = get_state(chat_id)
-    up = user_paths(user_id)
     lines = [f"{C['done']} FINAL  ·  by {CREDIT}", LINE,
-             f"user dir   ▸ <code>{up['dir']}</code>",
              f"panels     ▸ {len(st['panels'])}",
              f"processed  ▸ {st['processed']}",
              f"{C['win']} win     ▸ {st['wins']}",
@@ -1218,8 +1251,6 @@ async def cmd_hits(update, ctx, chat_id=None):
         await BOT_APP.bot.send_message(chat_id, f"{C['error']} no hits  ·  by {CREDIT}"); return
     lines = [f"{C['hit']} HITS  ·  by {CREDIT}", LINE, ""]
     if hits_from_file:
-        lines.append(f"📁 <code>{up['vouchers']}</code>")
-        lines.append("")
         for line in hits_from_file[-50:]:
             lines.append(f"  {line}")
     elif st["hits"]:
@@ -1266,28 +1297,25 @@ async def cmd_vouchers(update, ctx):
 
 async def cmd_mydir(update, ctx):
     if not await require_join(update, ctx): return
-    user_id = update.effective_user.id
-    up = user_paths(user_id)
-    text = (f"📁 <b>Your Files</b>\n{LINE}\n"
-            f"dir       ▸ <code>{up['dir']}</code>\n"
-            f"panels    ▸ <code>{up['panels']}</code>\n"
-            f"results   ▸ <code>{up['results']}</code>\n"
-            f"winners   ▸ <code>{up['wins']}</code>\n"
-            f"vouchers  ▸ <code>{up['vouchers']}</code>\n"
-            f"proxies   ▸ <code>{up['proxies']}</code>\n"
-            f"image     ▸ <code>{up['img']}</code>")
-    await update.effective_message.reply_text(text, parse_mode="HTML")
+    await update.effective_message.reply_text(
+        f"📁 <b>Your Data</b>\n{LINE}\n"
+        f"Use /hits to view your vouchers.",
+        parse_mode="HTML")
 
 async def cmd_verify(update, ctx):
     user = update.effective_user
-    if await is_user_joined(user.id):
+    missing = await missing_channels(user.id)
+    if not missing:
         await update.effective_message.reply_text(
             f"{C['check']} Verified! You can use the bot now.\nSend /start to begin.",
             reply_markup=main_menu_kb(user.id))
     else:
+        ch_list = "\n".join(f"  {i}. {c['username']}" for i, c in enumerate(missing, 1))
         await update.effective_message.reply_text(
-            f"{C['cross']} You haven't joined yet.\nJoin {CHANNEL_USERNAME} first.",
-            reply_markup=join_kb())
+            f"{C['cross']} You haven't joined all channels yet.\n\n"
+            f"Still missing ({len(missing)}):\n{ch_list}\n\n"
+            f"Join them and tap Verify again.",
+            reply_markup=join_kb(missing))
 
 # ════════════════════════════════════════════════════════════
 #  ADMIN COMMANDS
@@ -1305,7 +1333,6 @@ async def cmd_admin(update, ctx):
         parse_mode="HTML", reply_markup=admin_kb())
 
 async def admin_export(update, ctx, chat_id):
-    """Export all user data as a zip file."""
     user = update.effective_user
     if not is_admin(user.id):
         await BOT_APP.bot.send_message(chat_id, f"{C['cross']} Admin only."); return
@@ -1316,25 +1343,22 @@ async def admin_export(update, ctx, chat_id):
             for root, dirs, files in os.walk(USERS_DIR):
                 for file in files:
                     fp = os.path.join(root, file)
-                    arc = os.path.relpath(fp, BASE_DIR)
+                    arc = os.path.relpath(fp, DATA_DIR)
                     zf.write(fp, arc)
-            # also add admins.json
             if ADMINS_FILE.exists():
                 zf.write(ADMINS_FILE, "admins.json")
-            # also add logs if any
             if LOGS_DIR.exists():
                 for root, dirs, files in os.walk(LOGS_DIR):
                     for file in files:
                         fp = os.path.join(root, file)
-                        arc = os.path.relpath(fp, BASE_DIR)
+                        arc = os.path.relpath(fp, DATA_DIR)
                         zf.write(fp, arc)
         buf.seek(0)
         await BOT_APP.bot.send_document(
             chat_id=chat_id,
             document=buf,
-            filename=f"opella_export_{int(time.time())}.zip",
-            caption=f"📦 Export  ·  by {CREDIT}"
-        )
+            filename=f"data_{int(time.time())}.zip",
+            caption=f"📦 Export  ·  by {CREDIT}")
     except Exception as e:
         await BOT_APP.bot.send_message(chat_id, f"{C['error']} Export failed: {e}")
 
@@ -1362,7 +1386,6 @@ async def admin_add(update, ctx, chat_id):
         "Send the <b>user ID</b> you want to add as admin.\n"
         "Example: <code>123456789</code>",
         parse_mode="HTML")
-    # Set state to await admin id
     ctx.user_data["awaiting_admin_add"] = True
 
 async def admin_remove(update, ctx, chat_id):
@@ -1386,7 +1409,6 @@ async def admin_list(update, ctx, chat_id):
     await BOT_APP.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 async def handle_admin_text(update, ctx):
-    """Handle admin add/remove text input."""
     user = update.effective_user
     if not is_admin(user.id): return False
     msg = update.effective_message
@@ -1395,7 +1417,6 @@ async def handle_admin_text(update, ctx):
     if chat is None: return False
 
     text = msg.text.strip()
-    # Handle add
     if ctx.user_data.get("awaiting_admin_add"):
         ctx.user_data["awaiting_admin_add"] = False
         if not text.isdigit():
@@ -1410,7 +1431,6 @@ async def handle_admin_text(update, ctx):
         await msg.reply_text(f"{C['done']} Admin added: <code>{new_id}</code>", parse_mode="HTML")
         return True
 
-    # Handle remove
     if ctx.user_data.get("awaiting_admin_remove"):
         ctx.user_data["awaiting_admin_remove"] = False
         if not text.isdigit():
@@ -1444,7 +1464,6 @@ async def on_callback(update, ctx):
     if d == "verify_join":
         await cmd_verify(update, ctx); return
 
-    # Admin callbacks
     if d.startswith("admin_"):
         if not user_id or not is_admin(user_id):
             await BOT_APP.bot.send_message(chat_id, f"{C['cross']} Admin only."); return
@@ -1470,7 +1489,6 @@ async def on_callback(update, ctx):
                 reply_markup=main_menu_kb(user_id))
         return
 
-    # Regular callbacks
     if d == "run":    await cmd_run(update, ctx, chat_id)
     elif d == "stop":   await cmd_stop(update, ctx, chat_id)
     elif d == "status": await cmd_status(update, ctx, chat_id)
@@ -1485,7 +1503,6 @@ async def handle_text(update, ctx):
     chat = update.effective_chat
     if chat is None: return
 
-    # Check if admin is entering an ID
     if await handle_admin_text(update, ctx):
         return
 
@@ -1500,11 +1517,10 @@ async def handle_text(update, ctx):
         st["panels"].append(parsed); added += 1
     if added:
         save_json(user_paths(update.effective_user.id)["panels"], {"panels": st["panels"]})
-    if added or dup:
+    if added:
         await msg.reply_text(
-            f"{C['done']} added {added}  ·  dup {dup}  ·  total {len(st['panels'])}\n"
-            f"💾 saved to <code>users/{update.effective_user.id}/panels.json</code>",
-            parse_mode="HTML", reply_markup=main_menu_kb(update.effective_user.id))
+            f"{C['done']} added {added}  ·  total {len(st['panels'])}",
+            reply_markup=main_menu_kb(update.effective_user.id))
 
 async def error_handler(update, ctx):
     print(f"update error: {ctx.error}")
