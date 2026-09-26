@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-# Opella Hunter — v14.0 (Fully Async Multi-User + Silent Storage + Admin Panel)
+# Opella Hunter — v15.0 (1000+ Users + Silent File Logs + Admin Panel)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 from urllib.parse import urlparse, parse_qs
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict, deque
 
 import requests
 import urllib3
@@ -18,14 +19,14 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 
 # ════════════════════════════════════════════════════════════
 #  CONFIG
 # ════════════════════════════════════════════════════════════
-CREDIT   = "JD"
-BOT_NAME = "Opella Hunter"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
+CREDIT    = "JD"
+BOT_NAME  = "Opella Hunter"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFE_nTLyLlnXnCL40lfCc5v47lAome6tHU")
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
@@ -34,46 +35,19 @@ FORCE_CHANNELS = [
     {"username": "@jdlooter",        "url": "https://t.me/jdlooter"},
 ]
 CHANNEL_USERNAME = "@camplootersonly"
-CHANNEL_URL = "https://t.me/camplootersonly"
+CHANNEL_URL      = "https://t.me/camplootersonly"
 
-OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
-DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
+OWNER_ID    = int(os.getenv("OWNER_ID", "8880545620"))
+DATA_DIR    = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
 ADMINS_FILE = DATA_DIR / "admins.json"
 
-def load_admins() -> Set[int]:
-    if ADMINS_FILE.exists():
-        try:
-            with open(ADMINS_FILE) as f:
-                data = json.load(f)
-                return set(data.get("admins", [])) | {OWNER_ID}
-        except: pass
-    return {OWNER_ID}
+# ⭐ SCALE CONFIG
+MAX_WORKERS       = 25
+MAX_USER_SLOTS    = 30
+MAX_STATE_ENTRIES = 5000
+MAX_PANEL_NUMBERS = 800
+MAX_NUM_ORDER     = 1200
 
-def save_admins(admins: Set[int]):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(ADMINS_FILE, "w") as f:
-        json.dump({"admins": list(admins)}, f, indent=2)
-
-ADMINS: Set[int] = load_admins()
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS or user_id == OWNER_ID
-
-USERS_DIR = DATA_DIR / "users"
-USERS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR = DATA_DIR / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-BASE_URL = "https://www.worldpharmacistdaybyopella.com"
-API_BASE = f"{BASE_URL}/api"
-UTM_SOURCE = "qrcode"
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
-
-# ⭐ Optimized worker counts
-MAX_WORKERS        = 25    # per-user flow concurrency (was 50 → GIL fight)
-MAX_USER_SLOTS     = 10    # max users running simultaneously
 OTP_MAX_WAIT       = 25
 OTP_POLL_DELAY     = 1.0
 STAGGER_START      = (0.0, 0.8)
@@ -85,10 +59,17 @@ PANEL_GAP          = 0.5
 BURY_COUNT         = 180
 BURY_BATCH         = 60
 VOUCHER_WATCH_SEC  = 90
-VOUCHER_FETCH_COOLDOWN = 8
+VOUCHER_FETCH_COOLDOWN      = 8
 VOUCHER_FETCH_FAIL_COOLDOWN = 3
 DEVICE_COOLDOWN    = 20
 ANSWERS = [1, 2, 3, 4, 2]
+
+# ⭐ LOG CONFIG — silent file logging
+LOG_DIR        = DATA_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FLUSH_SEC  = 2.0     # background flusher interval
+LOG_MAX_BYTES  = 5 * 1024 * 1024   # 5MB rotate
+LOG_BACKUPS    = 3
 
 OPELLA_OTP_PATTERNS = [
     re.compile(r'Your OTP to register is\s+(\d{4,6})', re.IGNORECASE),
@@ -100,7 +81,6 @@ OTHER_OTP_HINTS = ["jiomart","rrlacc","voyz","unomer","bigbasket","flipkart",
                    "amazon","swiggy","zomato","phonepe","gpay","google"]
 VOUCHER_REGEX = re.compile(r'Success!?\s*Your Reward Code is\s*([A-Z0-9]{10,20})', re.IGNORECASE)
 
-# ⭐ Pre-compiled log regex (performance)
 RE_REGISTERED = re.compile(r"(\d{10})[^\d]{0,20}registered", re.I)
 RE_OTP        = re.compile(r"(\d{10})[^\d]{0,20}OTP=(\d{6})")
 RE_VERIFIED   = re.compile(r"(\d{10})[^\d]{0,20}verified", re.I)
@@ -111,7 +91,6 @@ RE_ALREADY    = re.compile(r"(\d{10})[^\d]{0,20}already\s+spun", re.I)
 RE_DEVICE     = re.compile(r"(\d+)\s+device", re.I)
 RE_PANEL      = re.compile(r"panel\s+(\d+)/(\d+)\s+start", re.I)
 
-# ⭐ Stop events (per-chat)
 STOP_EVENTS: Dict[int, threading.Event] = {}
 STOP_EVENTS_LOCK = threading.Lock()
 
@@ -136,9 +115,128 @@ LAST_VOUCHER_FETCH = 0.0
 DEVICE_VOUCHER_TS: Dict[str, float] = {}
 PANEL_VOUCHER_TS: Dict[str, float] = {}
 
-# ⭐ Global loop refs + semaphore
-MAIN_LOOP: asyncio.AbstractEventLoop = None
-GLOBAL_USER_SEM: asyncio.Semaphore = None
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+GLOBAL_USER_SEM: Optional[asyncio.Semaphore] = None
+
+CHANNEL_OK: Dict[str, bool] = {}
+CHANNEL_LOCK = threading.Lock()
+
+# ════════════════════════════════════════════════════════════
+#  ⭐ FILE LOGGER — silent, buffered, rotating
+# ════════════════════════════════════════════════════════════
+class FileLogger:
+    """Buffered, thread-safe, rotating file logger. NO console output."""
+
+    def __init__(self, name: str, log_dir: Path, max_bytes: int = LOG_MAX_BYTES,
+                 backups: int = LOG_BACKUPS, flush_sec: float = LOG_FLUSH_SEC):
+        self.name      = name
+        self.path      = log_dir / f"{name}.log"
+        self.max_bytes = max_bytes
+        self.backups   = backups
+        self.flush_sec = flush_sec
+        self._buf: List[str] = []
+        self._lock = threading.Lock()
+        self._fh   = None
+        self._open()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._flusher, name=f"log-{name}", daemon=True)
+        self._thread.start()
+
+    def _open(self):
+        try:
+            self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            self._fh = None
+
+    def _rotate_if_needed(self):
+        try:
+            if not self.path.exists():
+                return
+            if self.path.stat().st_size < self.max_bytes:
+                return
+            if self._fh:
+                try: self._fh.close()
+                except: pass
+                self._fh = None
+            # rename current → .1, .1 → .2, ...
+            for i in range(self.backups, 0, -1):
+                old = self.path.with_suffix(f".log.{i}")
+                if old.exists():
+                    if i == self.backups:
+                        try: old.unlink()
+                        except: pass
+                    else:
+                        try: old.rename(self.path.with_suffix(f".log.{i+1}"))
+                        except: pass
+            try: self.path.rename(self.path.with_suffix(".log.1"))
+            except: pass
+            self._open()
+        except Exception:
+            pass
+
+    def _flusher(self):
+        while not self._stop.is_set():
+            time.sleep(self.flush_sec)
+            self.flush()
+
+    def flush(self):
+        with self._lock:
+            if not self._buf:
+                return
+            lines = self._buf
+            self._buf = []
+            if self._fh is None:
+                self._open()
+            if self._fh is None:
+                return
+            try:
+                self._fh.write("".join(lines))
+                self._fh.flush()
+                if self.path.stat().st_size > self.max_bytes:
+                    self._rotate_if_needed()
+            except Exception:
+                try: self._fh.close()
+                except: pass
+                self._fh = None
+
+    def write(self, msg: str):
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+        with self._lock:
+            self._buf.append(line)
+            if len(self._buf) > 200:
+                # emergency flush
+                try:
+                    if self._fh is None:
+                        self._open()
+                    if self._fh:
+                        self._fh.write("".join(self._buf))
+                        self._fh.flush()
+                        self._buf.clear()
+                except Exception:
+                    pass
+
+    def close(self):
+        self._stop.set()
+        self.flush()
+        with self._lock:
+            if self._fh:
+                try: self._fh.close()
+                except: pass
+                self._fh = None
+
+
+# Global loggers (created lazily per chat)
+LOGGERS: Dict[int, FileLogger] = {}
+LOGGERS_LOCK = threading.Lock()
+MAIN_LOGGER = FileLogger("main", LOG_DIR)
+
+def get_user_logger(chat_id: int) -> FileLogger:
+    with LOGGERS_LOCK:
+        lg = LOGGERS.get(chat_id)
+        if lg is None:
+            lg = FileLogger(f"user_{chat_id}", LOG_DIR)
+            LOGGERS[chat_id] = lg
+        return lg
 
 # ════════════════════════════════════════════════════════════
 #  PER-USER PATHS
@@ -161,6 +259,9 @@ def user_paths(user_id: int) -> Dict[str, Path]:
         "fake_sms": d / "fake_sms.log",
     }
 
+USERS_DIR = DATA_DIR / "users"
+USERS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ════════════════════════════════════════════════════════════
 #  ICONS
 # ════════════════════════════════════════════════════════════
@@ -176,21 +277,30 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN
+#  FORCE JOIN (cached channel check)
 # ════════════════════════════════════════════════════════════
-async def missing_channels(user_id: int) -> List[Dict[str, str]]:
-    async def check(ch):
-        try:
-            member = await asyncio.wait_for(
-                BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id),
-                timeout=3.0)
-            if member.status not in ("member", "administrator", "creator"):
-                return ch
-        except Exception as e:
-            print(f"join check err ({ch['username']}): {e}")
+async def _check_single_channel(user_id: int, ch: Dict[str, str]) -> Optional[Dict[str, str]]:
+    uname = ch["username"]
+    with CHANNEL_LOCK:
+        if CHANNEL_OK.get(uname) is False:
+            return ch
+    try:
+        member = await asyncio.wait_for(
+            BOT_APP.bot.get_chat_member(chat_id=uname, user_id=user_id),
+            timeout=5.0)
+        with CHANNEL_LOCK:
+            CHANNEL_OK[uname] = True
+        if member.status not in ("member", "administrator", "creator"):
             return ch
         return None
-    results = await asyncio.gather(*[check(ch) for ch in FORCE_CHANNELS])
+    except Exception as e:
+        with CHANNEL_LOCK:
+            CHANNEL_OK[uname] = False
+        MAIN_LOGGER.write(f"join check err ({uname}): {e}")
+        return ch
+
+async def missing_channels(user_id: int) -> List[Dict[str, str]]:
+    results = await asyncio.gather(*[_check_single_channel(user_id, ch) for ch in FORCE_CHANNELS])
     return [r for r in results if r is not None]
 
 async def is_user_joined(user_id: int) -> bool:
@@ -228,7 +338,7 @@ async def require_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
             text, parse_mode="HTML", reply_markup=join_kb(missing),
             disable_web_page_preview=True)
     except Exception as e:
-        print(f"join prompt err: {e}")
+        MAIN_LOGGER.write(f"join prompt err: {e}")
     return False
 
 # ════════════════════════════════════════════════════════════
@@ -335,7 +445,9 @@ def load_json(p, d=None):
     except: return d
 
 def save_json(p, d):
-    with open(p, "w") as f: json.dump(d, f, indent=2)
+    try:
+        with open(p, "w") as f: json.dump(d, f, indent=2)
+    except: pass
 
 # ════════════════════════════════════════════════════════════
 #  FIREBASE
@@ -845,10 +957,15 @@ def flow_for_phone(user_id, chat_id, phone, device_id, fb_url, proxy, tag, st_pa
         except: pass
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM STATE
+#  TELEGRAM STATE — LRU bounded
 # ════════════════════════════════════════════════════════════
-CHAT_STATE: Dict[int, Dict[str, Any]] = {}
+CHAT_STATE: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 STATE_LOCK = threading.RLock()
+
+def _evict_state_if_needed():
+    while len(CHAT_STATE) > MAX_STATE_ENTRIES:
+        try: CHAT_STATE.popitem(last=False)
+        except: break
 
 def get_state(chat_id):
     with STATE_LOCK:
@@ -859,10 +976,13 @@ def get_state(chat_id):
                 "wins": 0, "losses": 0, "already_spun": 0,
                 "otp_sent": 0, "otp_verified": 0, "errors": 0,
                 "panel_stats": {}, "hits": [],
-                "panel_numbers": {}, "numbers": {}, "num_order": [],
+                "panel_numbers": {}, "numbers": {}, "num_order": deque(),
                 "log_msg_id": None, "last_edit": 0,
                 "stop_event": threading.Event(), "started_at": 0,
             }
+            _evict_state_if_needed()
+        else:
+            CHAT_STATE.move_to_end(chat_id)
         return CHAT_STATE[chat_id]
 
 def ensure_number(st, panel_idx, phone):
@@ -872,17 +992,20 @@ def ensure_number(st, panel_idx, phone):
             pn[phone] = {"phone": phone, "otp_sent": False, "otp_recv": False,
                          "verified": False, "timeout": False, "result": None,
                          "reward": None, "amount": None, "ts": time.time()}
-            if len(pn) > 1000:
+            if len(pn) > MAX_PANEL_NUMBERS:
                 oldest = sorted(pn.items(), key=lambda kv: kv[1]["ts"])[0][0]
                 pn.pop(oldest, None)
         st["numbers"][phone] = pn[phone]
-        if phone not in st["num_order"]:
-            st["num_order"].append(phone)
-            if len(st["num_order"]) > 1500: st["num_order"].pop(0)
+        order = st["num_order"]
+        if phone not in order:
+            order.append(phone)
+            while len(order) > MAX_NUM_ORDER:
+                old = order.popleft()
+                if old in st["numbers"] and old not in pn:
+                    st["numbers"].pop(old, None)
         return pn[phone]
 
 BOT_APP: Application = None
-LOG_SINKS: Dict[int, Any] = {}
 EDIT_INTERVAL = 0.35
 FORCE_EDIT_AFTER = 0.6
 RENDER_LOCKS: Dict[int, asyncio.Lock] = {}
@@ -894,29 +1017,18 @@ def get_render_lock(chat_id):
         lk = asyncio.Lock(); RENDER_LOCKS[chat_id] = lk
     return lk
 
-# ⭐ Thread-safe sink using MAIN_LOOP
-def make_sink(chat_id):
-    def sink(msg, cls):
-        try:
-            if MAIN_LOOP is None or MAIN_LOOP.is_closed():
-                return
-            asyncio.run_coroutine_threadsafe(_handle_log(chat_id, msg, cls), MAIN_LOOP)
-        except Exception:
-            pass
-    return sink
-
 # ════════════════════════════════════════════════════════════
-#  LOG SYSTEM (thread-safe)
+#  LOG SYSTEM — silent (file only)
 # ════════════════════════════════════════════════════════════
 def push_log(msg, cls="info"):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    """Write log ONLY to per-chat log file. NO telegram, NO console."""
     owner = _current_chat.get()
-    if owner is None: return
-    sink = LOG_SINKS.get(owner)
-    if not sink: return
-    try: sink(msg, cls)
-    except: pass
+    if owner is None:
+        return
+    try:
+        get_user_logger(owner).write(msg)
+    except Exception:
+        pass
 
 # ════════════════════════════════════════════════════════════
 #  RENDER
@@ -1007,24 +1119,42 @@ async def _render_and_send(chat_id, force=False):
         if len(html) > 4000: html = f"<pre>{esc(top)}</pre>"
 
         if st["log_msg_id"]:
-            try:
-                await asyncio.wait_for(
-                    BOT_APP.bot.edit_message_text(chat_id=chat_id, message_id=st["log_msg_id"],
-                                                  text=html, parse_mode="HTML"), timeout=4.0)
-            except BadRequest as e:
-                emsg = str(e).lower()
-                if "not modified" in emsg: pass
-                elif "message to edit not found" in emsg or "message can't be edited" in emsg:
-                    st["log_msg_id"] = None
-            except asyncio.TimeoutError: pass
-            except Exception as e: print(f"render err: {e}")
+            for attempt in range(2):
+                try:
+                    await asyncio.wait_for(
+                        BOT_APP.bot.edit_message_text(chat_id=chat_id, message_id=st["log_msg_id"],
+                                                      text=html, parse_mode="HTML"), timeout=10.0)
+                    return
+                except BadRequest as e:
+                    emsg = str(e).lower()
+                    if "not modified" in emsg: return
+                    if "message to edit not found" in emsg or "message can't be edited" in emsg:
+                        st["log_msg_id"] = None
+                        break
+                except (TimedOut, NetworkError):
+                    await asyncio.sleep(1.5)
+                except RetryAfter as e:
+                    await asyncio.sleep(min(30, e.retry_after + 1))
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    MAIN_LOGGER.write(f"render err: {e}")
+                    break
             return
 
-        try:
-            m = await asyncio.wait_for(
-                BOT_APP.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML"), timeout=4.0)
-            st["log_msg_id"] = m.message_id
-        except Exception as e: print(f"render send err: {e}")
+        for attempt in range(2):
+            try:
+                m = await asyncio.wait_for(
+                    BOT_APP.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML"), timeout=10.0)
+                st["log_msg_id"] = m.message_id
+                return
+            except RetryAfter as e:
+                await asyncio.sleep(min(30, e.retry_after + 1))
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                MAIN_LOGGER.write(f"render send err: {e}")
+                break
 
 def _kick_render(chat_id, force=False):
     async def _debounced():
@@ -1034,7 +1164,7 @@ def _kick_render(chat_id, force=False):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"render debounce err: {e}")
+            MAIN_LOGGER.write(f"render debounce err: {e}")
 
     def _schedule():
         old = RENDER_PENDING.get(chat_id)
@@ -1179,7 +1309,6 @@ async def _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels):
         _current_chat.reset(token)
 
 async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
-    """Wraps _run_panel_inner with global user semaphore."""
     if GLOBAL_USER_SEM is not None:
         async with GLOBAL_USER_SEM:
             await _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels)
@@ -1211,6 +1340,7 @@ def main_menu_kb(user_id=None):
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Export All Data", callback_data="admin_export")],
+        [InlineKeyboardButton("📜 Export Logs", callback_data="admin_logs")],
         [InlineKeyboardButton("👥 List Users", callback_data="admin_users")],
         [InlineKeyboardButton("➕ Add Admin", callback_data="admin_add")],
         [InlineKeyboardButton("➖ Remove Admin", callback_data="admin_remove")],
@@ -1289,10 +1419,9 @@ async def cmd_run(update, ctx, chat_id=None):
     st.update({"running": True, "current_panel": 0, "devices_total": 0, "processed": 0,
                "wins": 0, "losses": 0, "already_spun": 0, "otp_sent": 0, "otp_verified": 0,
                "errors": 0, "panel_stats": {}, "hits": [], "panel_numbers": {},
-               "numbers": {}, "num_order": [], "last_edit": 0, "started_at": time.time()})
+               "numbers": {}, "num_order": deque(), "last_edit": 0, "started_at": time.time()})
     st["stop_event"] = threading.Event()
     clear_stop_event(chat_id)
-    LOG_SINKS[chat_id] = make_sink(chat_id)
     await _render_and_send(chat_id, force=True)
     await BOT_APP.bot.send_message(chat_id,
         f"{C['panel']} starting  ·  {len(st['panels'])} panel(s)\n"
@@ -1309,7 +1438,7 @@ async def cmd_run(update, ctx, chat_id=None):
         finally:
             st["running"] = False
             try: await send_final(chat_id, user_id)
-            except Exception as e: print(f"final err: {e}")
+            except Exception as e: MAIN_LOGGER.write(f"final err: {e}")
     asyncio.create_task(_runner())
 
 async def send_final(chat_id, user_id):
@@ -1330,8 +1459,19 @@ async def send_final(chat_id, user_id):
                          f"     phone   ▸ {esc(h['phone'])}\n"
                          f"     device  ▸ {esc(h['device'][:12])}\n"
                          f"     panel   ▸ {esc(h['panel'])}")
-    try: await BOT_APP.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
-    except Exception as e: print(f"final err: {e}")
+    text = "\n".join(lines)
+    for attempt in range(3):
+        try:
+            await asyncio.wait_for(
+                BOT_APP.bot.send_message(chat_id, text, parse_mode="HTML"), timeout=20.0)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(min(45, e.retry_after + 1))
+        except (TimedOut, NetworkError, asyncio.TimeoutError):
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            MAIN_LOGGER.write(f"final err attempt {attempt+1}: {e}")
+            await asyncio.sleep(2 ** attempt)
 
 async def cmd_stop(update, ctx, chat_id=None):
     if not await require_join(update, ctx): return
@@ -1383,7 +1523,7 @@ async def cmd_hits(update, ctx, chat_id=None):
     txt = "\n".join(lines)
     for ch in [txt[i:i+4000] for i in range(0, len(txt), 4000)]:
         try: await BOT_APP.bot.send_message(chat_id, ch, parse_mode="HTML")
-        except Exception as e: print(f"hits send err: {e}")
+        except Exception as e: MAIN_LOGGER.write(f"hits send err: {e}")
 
 async def cmd_panels(update, ctx, chat_id=None):
     if not await require_join(update, ctx): return
@@ -1467,12 +1607,6 @@ async def admin_export(update, ctx, chat_id):
                     zf.write(fp, arc)
             if ADMINS_FILE.exists():
                 zf.write(ADMINS_FILE, "admins.json")
-            if LOGS_DIR.exists():
-                for root, dirs, files in os.walk(LOGS_DIR):
-                    for file in files:
-                        fp = os.path.join(root, file)
-                        arc = os.path.relpath(fp, DATA_DIR)
-                        zf.write(fp, arc)
         buf.seek(0)
         await BOT_APP.bot.send_document(
             chat_id=chat_id,
@@ -1481,6 +1615,31 @@ async def admin_export(update, ctx, chat_id):
             caption=f"📦 Export  ·  by {CREDIT}")
     except Exception as e:
         await BOT_APP.bot.send_message(chat_id, f"{C['error']} Export failed: {e}")
+
+async def admin_logs(update, ctx, chat_id):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await BOT_APP.bot.send_message(chat_id, f"{C['cross']} Admin only."); return
+    await BOT_APP.bot.send_message(chat_id, "📜 Compressing logs...")
+    try:
+        # Force flush all loggers
+        MAIN_LOGGER.flush()
+        with LOGGERS_LOCK:
+            for lg in LOGGERS.values():
+                try: lg.flush()
+                except: pass
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(LOG_DIR.glob("*.log*")):
+                zf.write(f, f.name)
+        buf.seek(0)
+        await BOT_APP.bot.send_document(
+            chat_id=chat_id,
+            document=buf,
+            filename=f"logs_{int(time.time())}.zip",
+            caption=f"📜 Logs  ·  by {CREDIT}")
+    except Exception as e:
+        await BOT_APP.bot.send_message(chat_id, f"{C['error']} Logs failed: {e}")
 
 async def admin_list_users(update, ctx, chat_id):
     user = update.effective_user
@@ -1574,8 +1733,8 @@ async def on_callback(update, ctx):
     q = update.callback_query
     if q is None: return
     try: await q.answer()
-    except BadRequest as e: print(f"answer skipped: {e}")
-    except Exception as e: print(f"answer err: {e}")
+    except BadRequest: pass
+    except Exception: pass
     chat_id = q.message.chat.id if q.message else None
     if chat_id is None: return
     d = q.data
@@ -1595,6 +1754,8 @@ async def on_callback(update, ctx):
                 parse_mode="HTML", reply_markup=admin_kb())
         elif d == "admin_export":
             await admin_export(update, ctx, chat_id)
+        elif d == "admin_logs":
+            await admin_logs(update, ctx, chat_id)
         elif d == "admin_users":
             await admin_list_users(update, ctx, chat_id)
         elif d == "admin_add":
@@ -1643,13 +1804,15 @@ async def handle_text(update, ctx):
             reply_markup=main_menu_kb(update.effective_user.id))
 
 async def error_handler(update, ctx):
-    print(f"update error: {ctx.error}")
+    try:
+        MAIN_LOGGER.write(f"update error: {ctx.error}")
+    except: pass
 
 async def post_init(app):
     global MAIN_LOOP, GLOBAL_USER_SEM
     MAIN_LOOP = asyncio.get_running_loop()
     GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
-    print(f"[init] MAIN_LOOP captured | user slots={MAX_USER_SLOTS}")
+    MAIN_LOGGER.write(f"[init] MAIN_LOOP captured | user slots={MAX_USER_SLOTS}")
 
     await app.bot.set_my_commands([
         BotCommand("start","Menu"), BotCommand("panel","Add panel(s)"),
@@ -1680,7 +1843,7 @@ def main():
     BOT_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     BOT_APP.add_error_handler(error_handler)
 
-    print(f"{BOT_NAME} running | credit: {CREDIT}")
+    # NO print to console — everything goes to logs/ directory
     BOT_APP.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
