@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v13.1 (Multi-User Optimized + Silent Storage + Admin Panel)
+# Opella Hunter — v14.0 (Fully Async Multi-User + Silent Storage + Admin Panel)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -71,21 +71,23 @@ UTM_SOURCE = "qrcode"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
 
-MAX_WORKERS    = 50
-OTP_MAX_WAIT   = 25
-OTP_POLL_DELAY = 1.0
-STAGGER_START  = (0.0, 0.8)
-NET_RETRIES    = 5
-NET_BACKOFF    = 0.8
-LANDING_SLEEP  = (0.15, 0.35)
-QUIZ_SLEEP     = (0.1, 0.25)
-PANEL_GAP      = 0.5
-BURY_COUNT     = 180
-BURY_BATCH     = 60
-VOUCHER_WATCH_SEC = 90
+# ⭐ Optimized worker counts
+MAX_WORKERS        = 25    # per-user flow concurrency (was 50 → GIL fight)
+MAX_USER_SLOTS     = 10    # max users running simultaneously
+OTP_MAX_WAIT       = 25
+OTP_POLL_DELAY     = 1.0
+STAGGER_START      = (0.0, 0.8)
+NET_RETRIES        = 5
+NET_BACKOFF        = 0.8
+LANDING_SLEEP      = (0.15, 0.35)
+QUIZ_SLEEP         = (0.1, 0.25)
+PANEL_GAP          = 0.5
+BURY_COUNT         = 180
+BURY_BATCH         = 60
+VOUCHER_WATCH_SEC  = 90
 VOUCHER_FETCH_COOLDOWN = 8
 VOUCHER_FETCH_FAIL_COOLDOWN = 3
-DEVICE_COOLDOWN = 20
+DEVICE_COOLDOWN    = 20
 ANSWERS = [1, 2, 3, 4, 2]
 
 OPELLA_OTP_PATTERNS = [
@@ -98,6 +100,18 @@ OTHER_OTP_HINTS = ["jiomart","rrlacc","voyz","unomer","bigbasket","flipkart",
                    "amazon","swiggy","zomato","phonepe","gpay","google"]
 VOUCHER_REGEX = re.compile(r'Success!?\s*Your Reward Code is\s*([A-Z0-9]{10,20})', re.IGNORECASE)
 
+# ⭐ Pre-compiled log regex (performance)
+RE_REGISTERED = re.compile(r"(\d{10})[^\d]{0,20}registered", re.I)
+RE_OTP        = re.compile(r"(\d{10})[^\d]{0,20}OTP=(\d{6})")
+RE_VERIFIED   = re.compile(r"(\d{10})[^\d]{0,20}verified", re.I)
+RE_TIMEOUT    = re.compile(r"(\d{10})[^\d]{0,20}OTP timeout", re.I)
+RE_WIN        = re.compile(r"WIN\s+(\d{10}).*reward=(\w+).*amt=(\d+)", re.I)
+RE_LOSE       = re.compile(r"(\d{10})\s+lose\s+reward=(\w+)", re.I)
+RE_ALREADY    = re.compile(r"(\d{10})[^\d]{0,20}already\s+spun", re.I)
+RE_DEVICE     = re.compile(r"(\d+)\s+device", re.I)
+RE_PANEL      = re.compile(r"panel\s+(\d+)/(\d+)\s+start", re.I)
+
+# ⭐ Stop events (per-chat)
 STOP_EVENTS: Dict[int, threading.Event] = {}
 STOP_EVENTS_LOCK = threading.Lock()
 
@@ -122,7 +136,9 @@ LAST_VOUCHER_FETCH = 0.0
 DEVICE_VOUCHER_TS: Dict[str, float] = {}
 PANEL_VOUCHER_TS: Dict[str, float] = {}
 
-HTTP_EXECUTOR = ThreadPoolExecutor(max_workers=300, thread_name_prefix="http")
+# ⭐ Global loop refs + semaphore
+MAIN_LOOP: asyncio.AbstractEventLoop = None
+GLOBAL_USER_SEM: asyncio.Semaphore = None
 
 # ════════════════════════════════════════════════════════════
 #  PER-USER PATHS
@@ -160,7 +176,7 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN (multi-channel parallel)
+#  FORCE JOIN
 # ════════════════════════════════════════════════════════════
 async def missing_channels(user_id: int) -> List[Dict[str, str]]:
     async def check(ch):
@@ -343,7 +359,7 @@ def fb_delete(url, timeout=6):
     except: return False
 
 # ════════════════════════════════════════════════════════════
-#  VOUCHER COOLDOWN HELPERS
+#  VOUCHER COOLDOWN
 # ════════════════════════════════════════════════════════════
 def _voucher_cooldown_ok(device_id: str = None, fb_url: str = None) -> bool:
     now = time.time()
@@ -878,30 +894,29 @@ def get_render_lock(chat_id):
         lk = asyncio.Lock(); RENDER_LOCKS[chat_id] = lk
     return lk
 
+# ⭐ Thread-safe sink using MAIN_LOOP
 def make_sink(chat_id):
     def sink(msg, cls):
         try:
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(_handle_log(chat_id, msg, cls), loop)
-        except: pass
+            if MAIN_LOOP is None or MAIN_LOOP.is_closed():
+                return
+            asyncio.run_coroutine_threadsafe(_handle_log(chat_id, msg, cls), MAIN_LOOP)
+        except Exception:
+            pass
     return sink
 
 # ════════════════════════════════════════════════════════════
-#  LOG SYSTEM
+#  LOG SYSTEM (thread-safe)
 # ════════════════════════════════════════════════════════════
 def push_log(msg, cls="info"):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
     owner = _current_chat.get()
-    if owner is not None:
-        sink = LOG_SINKS.get(owner)
-        if sink:
-            try: sink(msg, cls)
-            except: pass
-        return
-    for sink in list(LOG_SINKS.values()):
-        try: sink(msg, cls)
-        except: pass
+    if owner is None: return
+    sink = LOG_SINKS.get(owner)
+    if not sink: return
+    try: sink(msg, cls)
+    except: pass
 
 # ════════════════════════════════════════════════════════════
 #  RENDER
@@ -1013,40 +1028,56 @@ async def _render_and_send(chat_id, force=False):
 
 def _kick_render(chat_id, force=False):
     async def _debounced():
-        await asyncio.sleep(0.4)
-        await _render_and_send(chat_id, force=force)
-    try:
-        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.sleep(0.5)
+            await _render_and_send(chat_id, force=force)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"render debounce err: {e}")
+
+    def _schedule():
         old = RENDER_PENDING.get(chat_id)
         if old and not old.done():
             old.cancel()
-        RENDER_PENDING[chat_id] = loop.create_task(_debounced())
-    except: pass
+        RENDER_PENDING[chat_id] = asyncio.create_task(_debounced())
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(_schedule)
+    except RuntimeError:
+        if MAIN_LOOP and not MAIN_LOOP.is_closed():
+            MAIN_LOOP.call_soon_threadsafe(_schedule)
+    except Exception:
+        pass
 
 async def _handle_log(chat_id, msg, cls):
     st = get_state(chat_id)
     m = msg.strip()
     if not m: return
-    if re.search(r"→\s*\d+\s*user=", m): return
-    if "spin_raw" in m: return
     cur_pidx = st["current_panel"] or 1
-    mo = re.search(r"(\d{10})[^\d]{0,20}registered", m, re.I)
+
+    mo = RE_REGISTERED.search(m)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["otp_sent"] = True
         st["otp_sent"] += 1; _kick_render(chat_id); return
-    mo = re.search(r"(\d{10})[^\d]{0,20}OTP=(\d{6})", m)
+
+    mo = RE_OTP.search(m)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["otp_recv"] = True
         st["otp_verified"] += 1; _kick_render(chat_id); return
-    mo = re.search(r"(\d{10})[^\d]{0,20}verified", m, re.I)
+
+    mo = RE_VERIFIED.search(m)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["verified"] = True
         _kick_render(chat_id, force=True); return
-    mo = re.search(r"(\d{10})[^\d]{0,20}OTP timeout", m, re.I)
+
+    mo = RE_TIMEOUT.search(m)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["timeout"] = True
         st["errors"] += 1; _kick_render(chat_id, force=True); return
-    mo = re.search(r"WIN\s+(\d{10}).*reward=(\w+).*amt=(\d+)", m, re.I)
+
+    mo = RE_WIN.search(m)
     if mo:
         phone, rew, amt = mo.group(1), mo.group(2), mo.group(3)
         blk = ensure_number(st, cur_pidx, phone)
@@ -1055,7 +1086,8 @@ async def _handle_log(chat_id, msg, cls):
         st["panel_stats"].setdefault(cur_pidx, {"wins":0,"loss":0,"total":0})
         st["panel_stats"][cur_pidx]["wins"] += 1
         _kick_render(chat_id, force=True); return
-    mo = re.search(r"(\d{10})\s+lose\s+reward=(\w+)", m, re.I)
+
+    mo = RE_LOSE.search(m)
     if mo:
         phone, rew = mo.group(1), mo.group(2)
         blk = ensure_number(st, cur_pidx, phone); blk["result"] = "LOSE"; blk["reward"] = rew
@@ -1063,23 +1095,24 @@ async def _handle_log(chat_id, msg, cls):
         st["panel_stats"].setdefault(cur_pidx, {"wins":0,"loss":0,"total":0})
         st["panel_stats"][cur_pidx]["loss"] += 1
         _kick_render(chat_id, force=True); return
-    mo = re.search(r"(\d{10})[^\d]{0,20}already\s+spun", m, re.I)
+
+    mo = RE_ALREADY.search(m)
     if mo:
         blk = ensure_number(st, cur_pidx, mo.group(1)); blk["result"] = "ALREADY"
         st["already_spun"] += 1; _kick_render(chat_id); return
-    mo = re.search(r"(\d+)\s+device", m, re.I)
+
+    mo = RE_DEVICE.search(m)
     if mo and "found" in m.lower():
-        st["devices_total"] += int(mo.group(1)); _kick_render(chat_id, force=True); return
-    mo = re.search(r"panel\s+(\d+)/(\d+)\s+start", m, re.I)
+        st["devices_total"] += int(mo.group(1)); return
+
+    mo = RE_PANEL.search(m)
     if mo:
-        st["current_panel"] = int(mo.group(1)); _kick_render(chat_id, force=True); return
-    if re.search(r"err|exception", m, re.I):
-        st["errors"] += 1; _kick_render(chat_id); return
+        st["current_panel"] = int(mo.group(1)); return
 
 # ════════════════════════════════════════════════════════════
 #  PANEL RUNNER
 # ════════════════════════════════════════════════════════════
-async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
+async def _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels):
     st = get_state(chat_id)
     tag = f"P{panel_idx}"
     stop_ev = get_stop_event(chat_id)
@@ -1144,6 +1177,14 @@ async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
         push_log(f"Panel {panel_idx} DONE", "ok")
     finally:
         _current_chat.reset(token)
+
+async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
+    """Wraps _run_panel_inner with global user semaphore."""
+    if GLOBAL_USER_SEM is not None:
+        async with GLOBAL_USER_SEM:
+            await _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels)
+    else:
+        await _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels)
 
 # ════════════════════════════════════════════════════════════
 #  KEYBOARDS
@@ -1605,6 +1646,11 @@ async def error_handler(update, ctx):
     print(f"update error: {ctx.error}")
 
 async def post_init(app):
+    global MAIN_LOOP, GLOBAL_USER_SEM
+    MAIN_LOOP = asyncio.get_running_loop()
+    GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
+    print(f"[init] MAIN_LOOP captured | user slots={MAX_USER_SLOTS}")
+
     await app.bot.set_my_commands([
         BotCommand("start","Menu"), BotCommand("panel","Add panel(s)"),
         BotCommand("panels","List panels"), BotCommand("run","Start"),
@@ -1635,7 +1681,6 @@ def main():
     BOT_APP.add_error_handler(error_handler)
 
     print(f"{BOT_NAME} running | credit: {CREDIT}")
-    # ✅ Compatible with ALL python-telegram-bot versions
     BOT_APP.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
