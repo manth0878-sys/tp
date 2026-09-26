@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v15.1 (1000+ Users + Silent File Logs + Debug)
+# Opella Hunter — v15.2 (Auto-DATA_DIR + 1000+ Users + Silent File Logs)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -37,8 +37,32 @@ FORCE_CHANNELS = [
 CHANNEL_USERNAME = "@camplootersonly"
 CHANNEL_URL      = "https://t.me/camplootersonly"
 
-OWNER_ID    = int(os.getenv("OWNER_ID", "8880545620"))
-DATA_DIR    = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
+OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
+
+# ⭐ AUTO-DATA_DIR — /data use karo agar available ho (Railway volume)
+def _resolve_data_dir() -> Path:
+    env = os.getenv("DATA_DIR")
+    if env:
+        p = Path(env)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    # Auto-detect: /data exists & writable → use it
+    data_p = Path("/data")
+    if data_p.exists() and os.access(data_p, os.W_OK):
+        try:
+            test = data_p / ".write_test"
+            test.write_text("ok")
+            test.unlink()
+            return data_p
+        except Exception:
+            pass
+    # Fallback: script folder
+    return Path(__file__).parent.resolve()
+
+DATA_DIR    = _resolve_data_dir()
 ADMINS_FILE = DATA_DIR / "admins.json"
 
 # ⭐ SCALE CONFIG
@@ -65,11 +89,11 @@ DEVICE_COOLDOWN    = 20
 ANSWERS = [1, 2, 3, 4, 2]
 
 # ⭐ LOG CONFIG
-LOG_DIR        = DATA_DIR / "logs"
+LOG_DIR       = DATA_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FLUSH_SEC  = 2.0
-LOG_MAX_BYTES  = 5 * 1024 * 1024
-LOG_BACKUPS    = 3
+LOG_FLUSH_SEC = 2.0
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS   = 3
 
 OPELLA_OTP_PATTERNS = [
     re.compile(r'Your OTP to register is\s+(\d{4,6})', re.IGNORECASE),
@@ -250,6 +274,30 @@ def user_paths(user_id: int) -> Dict[str, Path]:
         "vouchers": d / "vouchers.txt",
         "fake_sms": d / "fake_sms.log",
     }
+
+# ════════════════════════════════════════════════════════════
+#  ADMIN HELPERS
+# ════════════════════════════════════════════════════════════
+def load_admins() -> Set[int]:
+    if ADMINS_FILE.exists():
+        try:
+            with open(ADMINS_FILE) as f:
+                data = json.load(f)
+                return set(data.get("admins", [])) | {OWNER_ID}
+        except: pass
+    return {OWNER_ID}
+
+def save_admins(admins: Set[int]):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ADMINS_FILE, "w") as f:
+            json.dump({"admins": list(admins)}, f, indent=2)
+    except: pass
+
+ADMINS: Set[int] = load_admins()
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS or user_id == OWNER_ID
 
 # ════════════════════════════════════════════════════════════
 #  ICONS
@@ -1799,15 +1847,17 @@ async def post_init(app):
     global MAIN_LOOP, GLOBAL_USER_SEM
     MAIN_LOOP = asyncio.get_running_loop()
     GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
-    # ⭐ Only these 5 debug lines print to console
     print("=" * 60, flush=True)
-    print(f"[startup] {BOT_NAME} v15.1", flush=True)
+    print(f"[startup] {BOT_NAME} v15.2", flush=True)
     print(f"[startup] DATA_DIR = {DATA_DIR}", flush=True)
     print(f"[startup] USERS_DIR = {USERS_DIR}", flush=True)
     print(f"[startup] LOG_DIR = {LOG_DIR}", flush=True)
+    print(f"[startup] ADMINS_FILE = {ADMINS_FILE}", flush=True)
     print(f"[startup] BOT_TOKEN set = {bool(BOT_TOKEN)}", flush=True)
     print(f"[startup] OWNER_ID = {OWNER_ID}", flush=True)
+    print(f"[startup] ADMINS = {sorted(ADMINS)}", flush=True)
     print(f"[startup] MAX_USER_SLOTS = {MAX_USER_SLOTS}", flush=True)
+    print(f"[startup] MAX_WORKERS = {MAX_WORKERS}", flush=True)
     print("=" * 60, flush=True)
 
     await app.bot.set_my_commands([
