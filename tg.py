@@ -26,7 +26,7 @@ from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 # ════════════════════════════════════════════════════════════
 CREDIT    = "JD"
 BOT_NAME  = "Opella Hunter"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE")
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
