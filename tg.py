@@ -25,7 +25,7 @@ from telegram.error import BadRequest
 # ════════════════════════════════════════════════════════════
 CREDIT   = "JD"
 BOT_NAME = "Opella Hunter"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFE_nTLyLlnXnCL40lfCc5v47lAome6tHU")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
