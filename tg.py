@@ -26,8 +26,7 @@ from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 # ════════════════════════════════════════════════════════════
 CREDIT    = "JD"
 BOT_NAME  = "Opella Hunter"
-BOT_TOKEN = os.getenv("8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE", "").strip()
-
+BOT_TOKEN = "8871069553:AAFBHDRPL1FIvdrQOS0KRCgrOhvj4URblxE"
 if not BOT_TOKEN:
     print("=" * 60, flush=True)
     print("[FATAL] BOT_TOKEN env variable not set!", flush=True)
