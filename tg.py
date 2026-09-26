@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v15.0 (1000+ Users + Silent File Logs + Admin Panel)
+# Opella Hunter — v15.1 (1000+ Users + Silent File Logs + Debug)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -64,11 +64,11 @@ VOUCHER_FETCH_FAIL_COOLDOWN = 3
 DEVICE_COOLDOWN    = 20
 ANSWERS = [1, 2, 3, 4, 2]
 
-# ⭐ LOG CONFIG — silent file logging
+# ⭐ LOG CONFIG
 LOG_DIR        = DATA_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FLUSH_SEC  = 2.0     # background flusher interval
-LOG_MAX_BYTES  = 5 * 1024 * 1024   # 5MB rotate
+LOG_FLUSH_SEC  = 2.0
+LOG_MAX_BYTES  = 5 * 1024 * 1024
 LOG_BACKUPS    = 3
 
 OPELLA_OTP_PATTERNS = [
@@ -122,11 +122,9 @@ CHANNEL_OK: Dict[str, bool] = {}
 CHANNEL_LOCK = threading.Lock()
 
 # ════════════════════════════════════════════════════════════
-#  ⭐ FILE LOGGER — silent, buffered, rotating
+#  ⭐ FILE LOGGER (silent, buffered, rotating)
 # ════════════════════════════════════════════════════════════
 class FileLogger:
-    """Buffered, thread-safe, rotating file logger. NO console output."""
-
     def __init__(self, name: str, log_dir: Path, max_bytes: int = LOG_MAX_BYTES,
                  backups: int = LOG_BACKUPS, flush_sec: float = LOG_FLUSH_SEC):
         self.name      = name
@@ -150,15 +148,12 @@ class FileLogger:
 
     def _rotate_if_needed(self):
         try:
-            if not self.path.exists():
-                return
-            if self.path.stat().st_size < self.max_bytes:
-                return
+            if not self.path.exists(): return
+            if self.path.stat().st_size < self.max_bytes: return
             if self._fh:
                 try: self._fh.close()
                 except: pass
                 self._fh = None
-            # rename current → .1, .1 → .2, ...
             for i in range(self.backups, 0, -1):
                 old = self.path.with_suffix(f".log.{i}")
                 if old.exists():
@@ -181,14 +176,11 @@ class FileLogger:
 
     def flush(self):
         with self._lock:
-            if not self._buf:
-                return
+            if not self._buf: return
             lines = self._buf
             self._buf = []
-            if self._fh is None:
-                self._open()
-            if self._fh is None:
-                return
+            if self._fh is None: self._open()
+            if self._fh is None: return
             try:
                 self._fh.write("".join(lines))
                 self._fh.flush()
@@ -204,10 +196,8 @@ class FileLogger:
         with self._lock:
             self._buf.append(line)
             if len(self._buf) > 200:
-                # emergency flush
                 try:
-                    if self._fh is None:
-                        self._open()
+                    if self._fh is None: self._open()
                     if self._fh:
                         self._fh.write("".join(self._buf))
                         self._fh.flush()
@@ -225,7 +215,6 @@ class FileLogger:
                 self._fh = None
 
 
-# Global loggers (created lazily per chat)
 LOGGERS: Dict[int, FileLogger] = {}
 LOGGERS_LOCK = threading.Lock()
 MAIN_LOGGER = FileLogger("main", LOG_DIR)
@@ -241,6 +230,9 @@ def get_user_logger(chat_id: int) -> FileLogger:
 # ════════════════════════════════════════════════════════════
 #  PER-USER PATHS
 # ════════════════════════════════════════════════════════════
+USERS_DIR = DATA_DIR / "users"
+USERS_DIR.mkdir(parents=True, exist_ok=True)
+
 def user_dir(user_id: int) -> Path:
     d = USERS_DIR / str(user_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -259,9 +251,6 @@ def user_paths(user_id: int) -> Dict[str, Path]:
         "fake_sms": d / "fake_sms.log",
     }
 
-USERS_DIR = DATA_DIR / "users"
-USERS_DIR.mkdir(parents=True, exist_ok=True)
-
 # ════════════════════════════════════════════════════════════
 #  ICONS
 # ════════════════════════════════════════════════════════════
@@ -277,7 +266,7 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 _current_chat = contextvars.ContextVar("current_chat", default=None)
 
 # ════════════════════════════════════════════════════════════
-#  FORCE JOIN (cached channel check)
+#  FORCE JOIN
 # ════════════════════════════════════════════════════════════
 async def _check_single_channel(user_id: int, ch: Dict[str, str]) -> Optional[Dict[str, str]]:
     uname = ch["username"]
@@ -957,7 +946,7 @@ def flow_for_phone(user_id, chat_id, phone, device_id, fb_url, proxy, tag, st_pa
         except: pass
 
 # ════════════════════════════════════════════════════════════
-#  TELEGRAM STATE — LRU bounded
+#  TELEGRAM STATE
 # ════════════════════════════════════════════════════════════
 CHAT_STATE: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 STATE_LOCK = threading.RLock()
@@ -1021,7 +1010,6 @@ def get_render_lock(chat_id):
 #  LOG SYSTEM — silent (file only)
 # ════════════════════════════════════════════════════════════
 def push_log(msg, cls="info"):
-    """Write log ONLY to per-chat log file. NO telegram, NO console."""
     owner = _current_chat.get()
     if owner is None:
         return
@@ -1622,7 +1610,6 @@ async def admin_logs(update, ctx, chat_id):
         await BOT_APP.bot.send_message(chat_id, f"{C['cross']} Admin only."); return
     await BOT_APP.bot.send_message(chat_id, "📜 Compressing logs...")
     try:
-        # Force flush all loggers
         MAIN_LOGGER.flush()
         with LOGGERS_LOCK:
             for lg in LOGGERS.values():
@@ -1812,7 +1799,16 @@ async def post_init(app):
     global MAIN_LOOP, GLOBAL_USER_SEM
     MAIN_LOOP = asyncio.get_running_loop()
     GLOBAL_USER_SEM = asyncio.Semaphore(MAX_USER_SLOTS)
-    MAIN_LOGGER.write(f"[init] MAIN_LOOP captured | user slots={MAX_USER_SLOTS}")
+    # ⭐ Only these 5 debug lines print to console
+    print("=" * 60, flush=True)
+    print(f"[startup] {BOT_NAME} v15.1", flush=True)
+    print(f"[startup] DATA_DIR = {DATA_DIR}", flush=True)
+    print(f"[startup] USERS_DIR = {USERS_DIR}", flush=True)
+    print(f"[startup] LOG_DIR = {LOG_DIR}", flush=True)
+    print(f"[startup] BOT_TOKEN set = {bool(BOT_TOKEN)}", flush=True)
+    print(f"[startup] OWNER_ID = {OWNER_ID}", flush=True)
+    print(f"[startup] MAX_USER_SLOTS = {MAX_USER_SLOTS}", flush=True)
+    print("=" * 60, flush=True)
 
     await app.bot.set_my_commands([
         BotCommand("start","Menu"), BotCommand("panel","Add panel(s)"),
@@ -1822,9 +1818,11 @@ async def post_init(app):
         BotCommand("mydir","My folder"), BotCommand("verify","Verify join"),
         BotCommand("admin","Admin panel"), BotCommand("clearpanels","Clear"),
     ])
+    print(f"[startup] Bot commands registered | polling starting...", flush=True)
 
 def main():
     global BOT_APP
+    print("[main] Building Application...", flush=True)
     BOT_APP = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     BOT_APP.add_handler(CommandHandler("start", cmd_start))
@@ -1843,7 +1841,7 @@ def main():
     BOT_APP.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     BOT_APP.add_error_handler(error_handler)
 
-    # NO print to console — everything goes to logs/ directory
+    print("[main] Handlers registered | calling run_polling...", flush=True)
     BOT_APP.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
