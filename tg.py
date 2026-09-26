@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Opella Hunter — v13.0 (Multi-User Optimized + Silent Storage + Admin Panel)
+# Opella Hunter — v13.1 (Multi-User Optimized + Silent Storage + Admin Panel)
 # Credits: JD
 
 import asyncio, base64, hashlib, hmac, io, json, os, random, re, string, sys, threading, time, itertools, contextvars, zipfile
@@ -25,7 +25,7 @@ from telegram.error import BadRequest
 # ════════════════════════════════════════════════════════════
 CREDIT   = "JD"
 BOT_NAME = "Opella Hunter"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEfpg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFE_nTLyLlnXnCL40lfCc5v47lAome6tHU")
 
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
@@ -98,7 +98,6 @@ OTHER_OTP_HINTS = ["jiomart","rrlacc","voyz","unomer","bigbasket","flipkart",
                    "amazon","swiggy","zomato","phonepe","gpay","google"]
 VOUCHER_REGEX = re.compile(r'Success!?\s*Your Reward Code is\s*([A-Z0-9]{10,20})', re.IGNORECASE)
 
-# ⭐ Per-chat stop events (replaces global STOP_EVENT)
 STOP_EVENTS: Dict[int, threading.Event] = {}
 STOP_EVENTS_LOCK = threading.Lock()
 
@@ -118,13 +117,11 @@ USED_OTPS = set()
 USED_OTPS_LOCK = threading.Lock()
 NO_PROXY = {"http": None, "https": None}
 
-# ⭐ Voucher cooldown trackers
 VOUCHER_COOLDOWN_LOCK = threading.Lock()
 LAST_VOUCHER_FETCH = 0.0
 DEVICE_VOUCHER_TS: Dict[str, float] = {}
 PANEL_VOUCHER_TS: Dict[str, float] = {}
 
-# ⭐ Global HTTP thread pool
 HTTP_EXECUTOR = ThreadPoolExecutor(max_workers=300, thread_name_prefix="http")
 
 # ════════════════════════════════════════════════════════════
@@ -1638,13 +1635,10 @@ def main():
     BOT_APP.add_error_handler(error_handler)
 
     print(f"{BOT_NAME} running | credit: {CREDIT}")
+    # ✅ Compatible with ALL python-telegram-bot versions
     BOT_APP.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        pool_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
     )
 
 if __name__ == "__main__":
