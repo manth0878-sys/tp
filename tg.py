@@ -31,7 +31,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8871069553:AAFsB1TsjrlG1IgNS0yX895F0kQHuHjEf
 FORCE_CHANNELS = [
     {"username": "@camplootersonly", "url": "https://t.me/camplootersonly"},
     {"username": "@unknown012021",   "url": "https://t.me/unknown012021"},
-    {"username": "@mh_lootifu",      "url": "https://t.me/MH_Lootify"},
+    {"username": "@mh_lootify",      "url": "https://t.me/MH_Lootify"},
     {"username": "@jdlooter",        "url": "https://t.me/jdlooter"},
 ]
 
